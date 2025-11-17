@@ -10,12 +10,15 @@ import finanzas
 import turnos
 import pedidos
 import usuarios
+import config
 
-DB_PATH = "pos_cremeria.db"
+# Obtener configuración desde secrets.toml
+DB_PATH = config.get_db_path()
 
 def hash_password(password):
-    """Encriptar contraseña usando SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Encriptar contraseña usando SHA-256 con salt"""
+    salt = config.get_password_salt()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
     """Verificar credenciales de usuario"""
@@ -107,6 +110,11 @@ def mostrar_login():
 
 def main():
     st.set_page_config(page_title="Punto de Venta - Cremería", layout="wide")
+    
+    # Verificar que los secretos estén configurados (solo en producción)
+    if config.is_production() and not config.check_secrets_available():
+        st.error("⚠️ Configuración de secretos no encontrada. Por favor configura secrets.toml")
+        st.stop()
     
     # Crear tabla de usuarios si no existe
     usuarios.crear_tabla_usuarios()

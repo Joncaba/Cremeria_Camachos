@@ -10,12 +10,15 @@ import finanzas
 import turnos
 import pedidos
 import usuarios
+import config
 
-DB_PATH = "pos_cremeria.db"
+# Obtener configuración desde secrets.toml
+DB_PATH = config.get_db_path()
 
 def hash_password(password):
-    """Encriptar contraseña usando SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Encriptar contraseña usando SHA-256 con salt"""
+    salt = config.get_password_salt()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
     """Verificar credenciales de usuario"""
