@@ -11,9 +11,13 @@ import turnos
 import pedidos
 import usuarios
 import config
+from db_adapter import get_db_adapter
 
 # Obtener configuración desde secrets.toml
 DB_PATH = config.get_db_path()
+
+# Inicializar adaptador de base de datos
+db = get_db_adapter()
 
 def hash_password(password):
     """Encriptar contraseña usando SHA-256 con salt"""
@@ -22,42 +26,24 @@ def hash_password(password):
 
 def verificar_credenciales(usuario, password):
     """Verificar credenciales de usuario"""
-    conn = sqlite3.connect(DB_PATH)
+    password_hash = hash_password(password)
+    
     try:
-        cursor = conn.cursor()
-        password_hash = hash_password(password)
-        
-        # Verificar qué columnas existen
-        cursor.execute("PRAGMA table_info(usuarios_admin)")
-        columnas = [col[1] for col in cursor.fetchall()]
-        
-        # Construir query según columnas disponibles
-        if 'nombre_completo' in columnas and 'rol' in columnas and 'activo' in columnas:
-            cursor.execute("""
-                SELECT usuario, nombre_completo, rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ? AND activo = 1
-            """, (usuario, password_hash))
-        elif 'nombre_completo' in columnas and 'rol' in columnas:
-            cursor.execute("""
-                SELECT usuario, nombre_completo, rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ?
-            """, (usuario, password_hash))
-        elif 'nombre_completo' in columnas:
-            cursor.execute("""
-                SELECT usuario, nombre_completo, 'admin' as rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ?
-            """, (usuario, password_hash))
-        else:
-            # Tabla antigua - solo verificar usuario y password
-            cursor.execute("""
-                SELECT usuario, usuario as nombre_completo, 'admin' as rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ?
-            """, (usuario, password_hash))
-        
-        resultado = cursor.fetchone()
-        return resultado
-    finally:
-        conn.close()
+        user = db.obtener_usuario(usuario)
+        if user and user.get('password') == password_hash:
+            # Verificar si está activo (si existe el campo)
+            if 'activo' in user and user['activo'] == 0:
+                return None
+            
+            return (
+                user.get('usuario'),
+                user.get('nombre_completo', usuario),
+                user.get('rol', 'admin')
+            )
+        return None
+    except Exception as e:
+        print(f"Error al verificar credenciales: {e}")
+        return None
 
 def mostrar_login():
     """Pantalla de inicio de sesión"""
@@ -85,7 +71,7 @@ def mostrar_login():
             st.write("**🔐 Iniciar Sesión**")
             
             usuario = st.text_input("👤 Usuario:", placeholder="Ingrese su usuario")
-            password = st.text_input("🔒 Contraseña:", type="password", placeholder="Ingrese su contraseña")
+            password = st.text_input("🔒 Contraseña:", type="password")
             
             submit = st.form_submit_button("🚀 Ingresar", type="primary", width='stretch')
             

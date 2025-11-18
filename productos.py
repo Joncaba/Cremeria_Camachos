@@ -5,9 +5,20 @@ import time
 import hashlib
 import unicodedata
 import re
+import config
+from db_adapter import get_db_adapter
+from sync_manager import get_sync_manager
 
+# Conexión SQLite para operaciones de productos (trabajo local)
 conn = sqlite3.connect("pos_cremeria.db", check_same_thread=False)
 cursor = conn.cursor()
+
+# Adaptador para autenticación de usuarios
+db_auth = get_db_adapter()
+
+# Gestor de sincronización SQLite <-> Supabase
+sync = get_sync_manager()
+db_auth = get_db_adapter()
 
 # === UTILIDADES DE BÚSQUEDA ===
 
@@ -47,17 +58,24 @@ def crear_tabla_usuarios():
     pass
 
 def hash_password(password):
-    """Crear hash de la contraseña"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Crear hash de la contraseña con salt"""
+    salt = config.get_password_salt()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
     """Verificar si las credenciales son correctas"""
     password_hash = hash_password(password)
-    cursor.execute(
-        "SELECT id FROM usuarios_admin WHERE usuario = ? AND password = ?", 
-        (usuario, password_hash)
-    )
-    return cursor.fetchone() is not None
+    try:
+        user = db_auth.obtener_usuario(usuario)
+        if user and user.get('password') == password_hash:
+            # Verificar si está activo
+            if 'activo' in user and user['activo'] == 0:
+                return False
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Error al verificar credenciales: {e}")
+        return False
 
 def crear_admin_por_defecto():
     """Crear usuario administrador por defecto si no existe - DEPRECADA"""
@@ -82,7 +100,7 @@ def mostrar_formulario_login():
         
         with col_login2:
             usuario = st.text_input("👤 Usuario:", placeholder="Ingresa tu usuario")
-            password = st.text_input("🔑 Contraseña:", type="password", placeholder="Ingresa tu contraseña")
+            password = st.text_input("🔑 Contraseña:", type="password")
             
             col_btn_login = st.columns([1, 2, 1])
             with col_btn_login[1]:
@@ -98,7 +116,6 @@ def mostrar_formulario_login():
                         st.rerun()
                     else:
                         st.error("❌ Credenciales incorrectas. Inténtalo de nuevo.")
-                        st.info("💡 **Credenciales por defecto:** Usuario: `admin` | Contraseña: `cremeria123`")
                 else:
                     st.warning("⚠️ Por favor, completa ambos campos.")
 
@@ -220,7 +237,17 @@ def agregar_producto(codigo, nombre, precio_compra, precio_normal, precio_mayore
     conn.commit()
     # Forzar flush al disco
     cursor.execute("PRAGMA wal_checkpoint(FULL)")
-    print(f"  > ✅ Producto guardado exitosamente\n")
+    print(f"  > ✅ Producto guardado en SQLite\n")
+    
+    # 🔄 SINCRONIZACIÓN AUTOMÁTICA A SUPABASE
+    if sync.is_online():
+        print(f"  > 🌐 Sincronizando a Supabase...")
+        if sync.auto_sync_after_save(codigo):
+            print(f"  > ✅ Producto sincronizado a Supabase exitosamente")
+        else:
+            print(f"  > ⚠️ No se pudo sincronizar a Supabase")
+    else:
+        print(f"  > 📴 Sin conexión - Producto guardado solo localmente")
 
 def eliminar_producto(codigo):
     cursor.execute("DELETE FROM productos WHERE codigo = ?", (codigo,))
@@ -460,6 +487,59 @@ def mostrar():
         
         # No mostrar el resto del contenido mientras se muestra el login
         return
+    
+    # 🔄 PANEL DE SINCRONIZACIÓN (Solo para admins)
+    if es_admin:
+        with st.expander("🔄 Sincronización SQLite ↔️ Supabase", expanded=False):
+            # Verificar estado de conexión
+            is_online = sync.is_online()
+            
+            col_sync_status, col_sync_actions = st.columns([2, 1])
+            
+            with col_sync_status:
+                if is_online:
+                    st.success("✅ **Conectado a Supabase** - Sincronización automática activa")
+                else:
+                    st.warning("📴 **Sin conexión a Supabase** - Trabajando en modo offline (SQLite local)")
+            
+            with col_sync_actions:
+                if st.button("🔄 Verificar Conexión", key="check_connection"):
+                    if sync.is_online():
+                        st.success("✅ Conexión verificada")
+                    else:
+                        st.error("❌ Sin conexión")
+                    st.rerun()
+            
+            if is_online:
+                st.markdown("---")
+                st.subheader("🔄 Opciones de Sincronización Manual")
+                
+                col_sync1, col_sync2 = st.columns(2)
+                
+                with col_sync1:
+                    st.markdown("**📤 Subir a Supabase:**")
+                    if st.button("⬆️ Sincronizar Todo Local → Supabase", key="sync_all_to_supabase", type="primary"):
+                        with st.spinner("Sincronizando productos a Supabase..."):
+                            result = sync.sync_all_productos_to_supabase()
+                            if 'error' in result:
+                                st.error(f"❌ Error: {result['error']}")
+                            else:
+                                st.success(f"✅ Sincronizados: {result['success']} | ❌ Fallidos: {result['failed']}")
+                        st.rerun()
+                
+                with col_sync2:
+                    st.markdown("**📥 Descargar desde Supabase:**")
+                    if st.button("⬇️ Sincronizar Todo Supabase → Local", key="sync_all_from_supabase", type="secondary"):
+                        with st.spinner("Sincronizando productos desde Supabase..."):
+                            result = sync.sync_all_productos_from_supabase()
+                            if 'error' in result:
+                                st.error(f"❌ Error: {result['error']}")
+                            else:
+                                st.success(f"✅ Sincronizados: {result['success']} | ❌ Fallidos: {result['failed']}")
+                        st.rerun()
+                
+                st.markdown("---")
+                st.caption("💡 **Sincronización automática:** Los productos se sincronizan automáticamente a Supabase después de cada guardado cuando hay conexión a internet.")
 
     # CSS para cambio automático
     st.markdown("""

@@ -889,7 +889,7 @@ def mostrar():
                     st.warning(f"⚠️ No encontrados: {', '.join(no_encontrados)}")
 
             # Fallback manual button (kept for safety)
-            if st.button("✅ PROCESAR TICKET", type="primary", width='stretch'):
+            if st.button("✅ PROCESAR TICKET", type="primary", use_container_width=True):
                 # user-triggered processing (same logic as automatic)
                 agregados = 0
                 no_encontrados = []
@@ -1032,7 +1032,7 @@ def mostrar():
             df_display["Ventas"] = 1
             # Reordenar columnas
             df_display = df_display[["Venta", "Fecha", "Hora", "Total", "Ventas"]]
-            st.dataframe(df_display.reset_index(drop=True), width='stretch')
+            st.dataframe(df_display.reset_index(drop=True), use_container_width=True)
         else:
             st.info("No se registraron ventas hoy.")
     
@@ -2008,7 +2008,7 @@ def mostrar():
                 st.dataframe(
                     df_resumen,
                     hide_index=True,
-                    width='stretch'
+                    use_container_width=True
                 )
                 
                 # Calcular totales

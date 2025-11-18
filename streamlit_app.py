@@ -1,19 +1,13 @@
 import streamlit as st
-import sqlite3
 import hashlib
-
-# Importar los módulos
-import productos
-import inventario
-import ventas
-import finanzas
-import turnos
-import pedidos
-import usuarios
 import config
+from db_adapter import get_db_adapter
 
 # Obtener configuración desde secrets.toml
 DB_PATH = config.get_db_path()
+
+# Inicializar adaptador de base de datos
+db = get_db_adapter()
 
 def hash_password(password):
     """Encriptar contraseña usando SHA-256 con salt"""
@@ -22,42 +16,24 @@ def hash_password(password):
 
 def verificar_credenciales(usuario, password):
     """Verificar credenciales de usuario"""
-    conn = sqlite3.connect(DB_PATH)
+    password_hash = hash_password(password)
+    
     try:
-        cursor = conn.cursor()
-        password_hash = hash_password(password)
-        
-        # Verificar qué columnas existen
-        cursor.execute("PRAGMA table_info(usuarios_admin)")
-        columnas = [col[1] for col in cursor.fetchall()]
-        
-        # Construir query según columnas disponibles
-        if 'nombre_completo' in columnas and 'rol' in columnas and 'activo' in columnas:
-            cursor.execute("""
-                SELECT usuario, nombre_completo, rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ? AND activo = 1
-            """, (usuario, password_hash))
-        elif 'nombre_completo' in columnas and 'rol' in columnas:
-            cursor.execute("""
-                SELECT usuario, nombre_completo, rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ?
-            """, (usuario, password_hash))
-        elif 'nombre_completo' in columnas:
-            cursor.execute("""
-                SELECT usuario, nombre_completo, 'admin' as rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ?
-            """, (usuario, password_hash))
-        else:
-            # Tabla antigua - solo verificar usuario y password
-            cursor.execute("""
-                SELECT usuario, usuario as nombre_completo, 'admin' as rol FROM usuarios_admin 
-                WHERE usuario = ? AND password = ?
-            """, (usuario, password_hash))
-        
-        resultado = cursor.fetchone()
-        return resultado
-    finally:
-        conn.close()
+        user = db.obtener_usuario(usuario)
+        if user and user.get('password') == password_hash:
+            # Verificar si está activo (si existe el campo)
+            if 'activo' in user and user['activo'] == 0:
+                return None
+            
+            return (
+                user.get('usuario'),
+                user.get('nombre_completo', usuario),
+                user.get('rol', 'admin')
+            )
+        return None
+    except Exception as e:
+        print(f"Error al verificar credenciales: {e}")
+        return None
 
 def mostrar_login():
     """Pantalla de inicio de sesión"""
@@ -85,7 +61,7 @@ def mostrar_login():
             st.write("**🔐 Iniciar Sesión**")
             
             usuario = st.text_input("👤 Usuario:", placeholder="Ingrese su usuario")
-            password = st.text_input("🔒 Contraseña:", type="password", placeholder="Ingrese su contraseña")
+            password = st.text_input("🔒 Contraseña:", type="password")
             
             submit = st.form_submit_button("🚀 Ingresar", type="primary", use_container_width=True)
             
@@ -101,6 +77,7 @@ def mostrar_login():
                         st.session_state.rol_usuario = resultado[2]
                         
                         # Actualizar último acceso
+                        import usuarios
                         usuarios.actualizar_ultimo_acceso(resultado[0])
                         
                         st.success(f"✅ Bienvenido, {resultado[1]}!")
@@ -116,15 +93,15 @@ def main():
         st.error("⚠️ Configuración de secretos no encontrada. Por favor configura secrets.toml")
         st.stop()
     
-    # Crear tabla de usuarios si no existe
-    usuarios.crear_tabla_usuarios()
-    
     # Verificar autenticación
     if 'autenticado' not in st.session_state:
         st.session_state.autenticado = False
     
     # Si no está autenticado, mostrar login
     if not st.session_state.autenticado:
+        # Solo importar usuarios cuando sea necesario
+        import usuarios
+        usuarios.crear_tabla_usuarios()
         mostrar_login()
         return
     
@@ -175,19 +152,27 @@ def main():
     
     seleccion = st.session_state.pagina_seleccionada
 
+    # Imports lazy - solo cargar el módulo necesario
     if seleccion == "Punto de Venta":
+        import ventas
         ventas.mostrar()
     elif seleccion == "Gestión de Productos":
+        import productos
         productos.mostrar()
     elif seleccion == "Inventario":
+        import inventario
         inventario.mostrar()
     elif seleccion == "Pedidos y Reabastecimiento":
+        import pedidos
         pedidos.mostrar()
     elif seleccion == "Finanzas":
+        import finanzas
         finanzas.mostrar()
     elif seleccion == "Turnos y Atención al Cliente":
+        import turnos
         turnos.mostrar()
     elif seleccion == "Gestión de Usuarios":
+        import usuarios
         usuarios.mostrar()
 
 if __name__ == "__main__":

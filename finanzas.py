@@ -400,7 +400,7 @@ def mostrar_resumen_financiero_completo():
                     title='Composición de Egresos'
                 )
                 fig_egresos.update_layout(height=400)
-                st.plotly_chart(fig_egresos, width='stretch')
+                st.plotly_chart(fig_egresos, use_container_width=True)
 
 def mostrar_registro_egresos():
     st.subheader("📉 Registrar Egresos")
@@ -797,7 +797,7 @@ def mostrar_historial_financiero():
                 labels={'balance_acumulado': 'Balance ($)', 'fecha': 'Fecha'}
             )
             fig_balance.update_layout(height=400)
-            st.plotly_chart(fig_balance, width='stretch')
+            st.plotly_chart(fig_balance, use_container_width=True)
     else:
         st.info("No hay movimientos financieros en el período seleccionado")
 
@@ -874,7 +874,7 @@ def mostrar_resumen_general():
                     color_continuous_scale='viridis'
                 )
                 fig_top.update_layout(height=400, showlegend=False)
-                st.plotly_chart(fig_top, width='stretch')
+                st.plotly_chart(fig_top, use_container_width=True)
             else:
                 st.info("No hay datos suficientes para el gráfico")
         else:
@@ -899,7 +899,7 @@ def mostrar_resumen_general():
                 )
                 fig_cliente.update_traces(textposition='inside', textinfo='percent+label')
                 fig_cliente.update_layout(height=400)
-                st.plotly_chart(fig_cliente, width='stretch')
+                st.plotly_chart(fig_cliente, use_container_width=True)
             else:
                 st.info("No hay datos de tipos de cliente")
         else:
@@ -952,7 +952,7 @@ def mostrar_resumen_general():
                 )
                 fig_metodos.update_traces(textposition='inside', textinfo='percent+label')
                 fig_metodos.update_layout(height=400)
-                st.plotly_chart(fig_metodos, width='stretch')
+                st.plotly_chart(fig_metodos, use_container_width=True)
 
     # Tendencias de ventas por fecha
     st.divider()
@@ -985,7 +985,7 @@ def mostrar_resumen_general():
                         labels={'total_ventas': 'Ingresos ($)', 'fecha': 'Fecha'}
                     )
                     fig_tendencia.update_layout(height=400)
-                    st.plotly_chart(fig_tendencia, width='stretch')
+                    st.plotly_chart(fig_tendencia, use_container_width=True)
                 
                 with col_tend2:
                     # Gráfico de número de transacciones por día
@@ -999,7 +999,7 @@ def mostrar_resumen_general():
                         color_continuous_scale='blues'
                     )
                     fig_transacciones.update_layout(height=400, showlegend=False)
-                    st.plotly_chart(fig_transacciones, width='stretch')
+                    st.plotly_chart(fig_transacciones, use_container_width=True)
                 
                 # Estadísticas de tendencia
                 col_est1, col_est2, col_est3 = st.columns(3)
@@ -1149,7 +1149,7 @@ def mostrar_ventas_por_dia():
         fig_ventas_dia.update_layout(showlegend=False)
 
     fig_ventas_dia.update_layout(height=400)
-    st.plotly_chart(fig_ventas_dia, width='stretch')
+    st.plotly_chart(fig_ventas_dia, use_container_width=True)
     
     # Tabla detallada por día
     st.subheader("📋 Detalle por Día")

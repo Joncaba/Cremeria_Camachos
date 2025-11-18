@@ -7,7 +7,16 @@ import hashlib
 import unicodedata
 import re
 
+# Importar sistema unificado de autenticación
+from db_adapter import get_db_adapter
+import config
+from sync_manager import get_sync_manager
+
 DB_PATH = "pos_cremeria.db"
+
+# Inicializar adaptador de base de datos y sync manager
+db = get_db_adapter()
+sync = get_sync_manager()
 
 # === UTILIDADES DE BÚSQUEDA ===
 
@@ -40,34 +49,27 @@ def busqueda_flexible(texto_busqueda, texto_objetivo):
 
 # === SISTEMA DE AUTENTICACIÓN PARA ADMINISTRACIÓN ===
 
-def crear_tabla_usuarios():
-    """Crear tabla de usuarios administradores si no existe - DEPRECADA"""
-    # Esta función ahora está en usuarios.py
-    # Se mantiene solo para compatibilidad
-    pass
-
 def hash_password(password):
-    """Crear hash de la contraseña"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Crear hash de la contraseña usando salt del config"""
+    salt = config.get_password_salt()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
-    """Verificar si las credenciales son correctas"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    password_hash = hash_password(password)
-    cursor.execute(
-        "SELECT id FROM usuarios_admin WHERE usuario = ? AND password = ?", 
-        (usuario, password_hash)
-    )
-    resultado = cursor.fetchone()
-    conn.close()
-    return resultado is not None
-
-def crear_admin_por_defecto():
-    """Crear usuario administrador por defecto si no existe - DEPRECADA"""
-    # Esta función ahora está en usuarios.py
-    # Se mantiene solo para compatibilidad
-    return False
+    """Verificar si las credenciales son correctas usando el sistema unificado"""
+    try:
+        # Calcular hash de la contraseña ingresada
+        password_hash = hash_password(password)
+        
+        # Obtener usuario de la base de datos
+        usuario_db = db.obtener_usuario(usuario)
+        
+        if usuario_db and usuario_db.get('password') == password_hash:
+            return True
+        
+        return False
+    except Exception as e:
+        print(f"Error al verificar credenciales: {e}")
+        return False
 
 def verificar_sesion_admin():
     """Verificar si hay una sesión administrativa activa"""
@@ -117,7 +119,8 @@ def obtener_productos_bajo_stock():
     conn = sqlite3.connect(DB_PATH)
     
     query = """
-    SELECT codigo, nombre, stock, stock_minimo, stock_kg, stock_minimo_kg, tipo_venta,
+    SELECT codigo, nombre, stock, stock_minimo, stock_kg, stock_minimo_kg, 
+           stock_maximo, stock_maximo_kg, tipo_venta,
            precio_compra, precio_normal, precio_por_kg, categoria,
            CASE 
                WHEN tipo_venta = 'granel' THEN 
@@ -128,7 +131,13 @@ def obtener_productos_bajo_stock():
            CASE 
                WHEN tipo_venta = 'granel' THEN ROUND((stock_minimo_kg - stock_kg), 2)
                ELSE (stock_minimo - stock)
-           END as cantidad_necesaria
+           END as cantidad_necesaria,
+           CASE 
+               WHEN tipo_venta = 'granel' THEN 
+                   ROUND(CASE WHEN stock_maximo_kg > 0 THEN stock_maximo_kg ELSE stock_minimo_kg * 2 END - stock_kg, 2)
+               ELSE 
+                   (CASE WHEN stock_maximo > 0 THEN stock_maximo ELSE stock_minimo * 2 END - stock)
+           END as cantidad_hasta_maximo
     FROM productos 
     WHERE (
         (tipo_venta = 'unidad' AND stock <= (stock_minimo * 0.5) AND stock_minimo > 0) OR
@@ -255,6 +264,13 @@ def actualizar_stock_desde_pedido(codigo_producto, cantidad_recibida):
 def mostrar():
     st.title("🛒 Gestión de Pedidos y Reabastecimiento")
     
+    # Sincronizar datos desde Supabase al inicio (solo si hay conexión)
+    if sync.is_online():
+        with st.spinner('🔄 Sincronizando datos desde Supabase...'):
+            resultado = sync.sync_all_productos_from_supabase()
+            if resultado.get('success', 0) > 0:
+                st.toast(f"✅ {resultado['success']} productos sincronizados desde la nube")
+    
     # Verificar si hay productos transferidos desde inventario
     if st.session_state.get('productos_para_pedido') and st.session_state.get('origen_pedido') == 'inventario':
         productos_transferidos = st.session_state.productos_para_pedido
@@ -292,24 +308,50 @@ def mostrar():
                 st.rerun()
         else:
             if st.button("🔑 Acceso Admin", type="primary", key="login_pedidos"):
-                # Mostrar login inline
-                with st.form("login_form_pedidos"):
-                    usuario = st.text_input("👤 Usuario:", placeholder="admin")
-                    password = st.text_input("🔑 Contraseña:", type="password", placeholder="cremeria123")
-                    
-                    if st.form_submit_button("🔓 INICIAR SESIÓN", type="primary"):
-                        if usuario and password:
-                            if verificar_credenciales(usuario, password):
-                                st.session_state.admin_pedidos_autenticado = True
-                                st.session_state.usuario_admin_pedidos = usuario
-                                st.success("✅ ¡Acceso concedido! Redirigiendo...")
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.error("❌ Credenciales incorrectas")
-                        else:
-                            st.warning("⚠️ Completa ambos campos")
-                return
+                st.session_state.mostrar_login_pedidos = True
+                st.rerun()
+    
+    # Mostrar formulario de login si se solicita
+    if not es_admin and st.session_state.get('mostrar_login_pedidos', False):
+        st.markdown("---")
+        st.subheader("🔐 Acceso Administrativo")
+        
+        with st.form("login_form_pedidos"):
+            col1, col2 = st.columns(2)
+            with col1:
+                usuario = st.text_input("👤 Usuario:", placeholder="admin", key="usuario_pedidos_form")
+            with col2:
+                password = st.text_input("🔑 Contraseña:", type="password", key="password_pedidos_form")
+            
+            col_submit1, col_submit2, col_submit3 = st.columns([1, 1, 1])
+            with col_submit2:
+                submitted = st.form_submit_button("🔓 INICIAR SESIÓN", type="primary", use_container_width=True)
+            
+            if submitted:
+                if usuario and password:
+                    if verificar_credenciales(usuario, password):
+                        st.session_state.admin_pedidos_autenticado = True
+                        st.session_state.usuario_admin_pedidos = usuario
+                        st.session_state.mostrar_login_pedidos = False
+                        st.success("✅ ¡Acceso concedido! Redirigiendo...")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("❌ Credenciales incorrectas. Usuario: 'admin' | Contraseña: 'Creme$123'")
+                else:
+                    st.warning("⚠️ Por favor completa ambos campos")
+        
+        # Botón para cancelar login
+        col_cancel = st.columns([1, 2, 1])
+        with col_cancel[1]:
+            if st.button("❌ Cancelar Login", type="secondary", key="cancel_login_pedidos"):
+                st.session_state.mostrar_login_pedidos = False
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # No mostrar el resto del contenido mientras se muestra el login
+        return
     
     st.divider()
     
@@ -375,9 +417,24 @@ def mostrar():
                                 tipo_icono = "⚖️" if producto['tipo_venta'] == 'granel' else "📦"
                                 estado_color = "🔴" if producto['porcentaje_stock'] < 25 else "🟡"
                                 
+                                # Mostrar información según tipo de venta
+                                if producto['tipo_venta'] == 'granel':
+                                    stock_actual = producto['stock_kg']
+                                    stock_min = producto['stock_minimo_kg']
+                                    stock_max = producto.get('stock_maximo_kg', stock_min * 2)
+                                    unidad = "kg"
+                                else:
+                                    stock_actual = producto['stock']
+                                    stock_min = producto['stock_minimo']
+                                    stock_max = producto.get('stock_maximo', stock_min * 2)
+                                    unidad = "unid."
+                                
+                                cantidad_hasta_maximo = producto.get('cantidad_hasta_maximo', 0)
+                                
                                 st.markdown(f"""
                                 **{tipo_icono} {producto['nombre']}** {estado_color}  
-                                📊 Stock: {producto['stock']} | Mín: {producto['stock_minimo']} | Necesita: {producto['cantidad_necesaria']}  
+                                📊 Stock: {stock_actual:.1f} {unidad} | Mín: {stock_min:.1f} {unidad} | Máx: {stock_max:.1f} {unidad}  
+                                📦 Para mínimo: **{producto['cantidad_necesaria']:.1f} {unidad}** | Para máximo: **{cantidad_hasta_maximo:.1f} {unidad}**  
                                 💰 Precio: ${producto['precio_compra']:.2f}
                                 """)
                             
@@ -435,9 +492,24 @@ def mostrar():
                         tipo_icono = "⚖️" if producto['tipo_venta'] == 'granel' else "📦"
                         estado_color = "🔴" if producto['porcentaje_stock'] < 25 else "🟡"
                         
+                        # Mostrar información según tipo de venta
+                        if producto['tipo_venta'] == 'granel':
+                            stock_actual = producto['stock_kg']
+                            stock_min = producto['stock_minimo_kg']
+                            stock_max = producto.get('stock_maximo_kg', stock_min * 2)
+                            unidad = "kg"
+                        else:
+                            stock_actual = producto['stock']
+                            stock_min = producto['stock_minimo']
+                            stock_max = producto.get('stock_maximo', stock_min * 2)
+                            unidad = "unid."
+                        
+                        cantidad_hasta_maximo = producto.get('cantidad_hasta_maximo', 0)
+                        
                         st.markdown(f"""
                         **{tipo_icono} {producto['nombre']}** {estado_color}  
-                        📊 Stock: {producto['stock']} | Mín: {producto['stock_minimo']} | Necesita: {producto['cantidad_necesaria']}  
+                        📊 Stock: {stock_actual:.1f} {unidad} | Mín: {stock_min:.1f} {unidad} | Máx: {stock_max:.1f} {unidad}  
+                        📦 Para mínimo: **{producto['cantidad_necesaria']:.1f} {unidad}** | Para máximo: **{cantidad_hasta_maximo:.1f} {unidad}**  
                         💰 Precio: ${producto['precio_compra']:.2f}
                         """)
                     
@@ -694,9 +766,53 @@ def mostrar():
         with col_met4:
             if not pedidos_df.empty:
                 inversion_total = pedidos_df[pedidos_df['completado'] == 0]['costo_total'].sum()
-                st.metric("💰 Inversión Pendiente", f"${inversion_total:.2f}")
+                st.metric("💰 Inversión Pedidos", f"${inversion_total:.2f}")
             else:
-                st.metric("💰 Inversión Pendiente", "$0.00")
+                st.metric("💰 Inversión Pedidos", "$0.00")
+        
+        # Nueva fila de métricas para reabastecimiento
+        st.divider()
+        st.write("### 💵 Inversión para Reabastecimiento Completo")
+        
+        col_inv1, col_inv2, col_inv3 = st.columns(3)
+        
+        with col_inv1:
+            if not productos_bajo_stock.empty:
+                # Calcular inversión necesaria para alcanzar stock mínimo
+                inversion_minimo = (productos_bajo_stock['cantidad_necesaria'] * productos_bajo_stock['precio_compra']).sum()
+                st.metric(
+                    "📊 Hasta Stock Mínimo", 
+                    f"${inversion_minimo:.2f}",
+                    help="Inversión necesaria para que todos los productos alcancen su stock mínimo"
+                )
+            else:
+                st.metric("📊 Hasta Stock Mínimo", "$0.00")
+        
+        with col_inv2:
+            if not productos_bajo_stock.empty and 'cantidad_hasta_maximo' in productos_bajo_stock.columns:
+                # Calcular inversión necesaria para alcanzar stock máximo
+                inversion_maximo = (productos_bajo_stock['cantidad_hasta_maximo'] * productos_bajo_stock['precio_compra']).sum()
+                st.metric(
+                    "🎯 Hasta Stock Máximo", 
+                    f"${inversion_maximo:.2f}",
+                    help="Inversión necesaria para que todos los productos alcancen su stock máximo (capacidad completa)"
+                )
+            else:
+                st.metric("🎯 Hasta Stock Máximo", "$0.00")
+        
+        with col_inv3:
+            if not productos_bajo_stock.empty and 'cantidad_hasta_maximo' in productos_bajo_stock.columns:
+                # Calcular diferencia de inversión
+                inversion_minimo = (productos_bajo_stock['cantidad_necesaria'] * productos_bajo_stock['precio_compra']).sum()
+                inversion_maximo = (productos_bajo_stock['cantidad_hasta_maximo'] * productos_bajo_stock['precio_compra']).sum()
+                diferencia = inversion_maximo - inversion_minimo
+                st.metric(
+                    "💎 Inversión Adicional", 
+                    f"${diferencia:.2f}",
+                    help="Diferencia entre alcanzar stock mínimo vs stock máximo"
+                )
+            else:
+                st.metric("💎 Inversión Adicional", "$0.00")
         
         # Exportar datos
         st.divider()
