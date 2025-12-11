@@ -5,9 +5,22 @@ import time
 import hashlib
 import unicodedata
 import re
+import config
+from datetime import datetime, timedelta
+from db_adapter import get_db_adapter
+from sync_manager import get_sync_manager
+from auth_manager import verificar_sesion_admin, cerrar_sesion_admin, obtener_tiempo_restante, mostrar_formulario_login
 
+# Conexión SQLite para operaciones de productos (trabajo local)
 conn = sqlite3.connect("pos_cremeria.db", check_same_thread=False)
 cursor = conn.cursor()
+
+# Adaptador para autenticación de usuarios
+db_auth = get_db_adapter()
+
+# Gestor de sincronización SQLite <-> Supabase
+sync = get_sync_manager()
+db_auth = get_db_adapter()
 
 # === UTILIDADES DE BÚSQUEDA ===
 
@@ -47,17 +60,24 @@ def crear_tabla_usuarios():
     pass
 
 def hash_password(password):
-    """Crear hash de la contraseña"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Crear hash de la contraseña con salt"""
+    salt = config.get_password_salt()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
     """Verificar si las credenciales son correctas"""
     password_hash = hash_password(password)
-    cursor.execute(
-        "SELECT id FROM usuarios_admin WHERE usuario = ? AND password = ?", 
-        (usuario, password_hash)
-    )
-    return cursor.fetchone() is not None
+    try:
+        user = db_auth.obtener_usuario(usuario)
+        if user and user.get('password') == password_hash:
+            # Verificar si está activo
+            if 'activo' in user and user['activo'] == 0:
+                return False
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Error al verificar credenciales: {e}")
+        return False
 
 def crear_admin_por_defecto():
     """Crear usuario administrador por defecto si no existe - DEPRECADA"""
@@ -65,53 +85,7 @@ def crear_admin_por_defecto():
     # Se mantiene solo para compatibilidad
     return False
 
-def mostrar_formulario_login():
-    """Mostrar formulario de login para administradores"""
-    st.markdown("""
-    <div style="background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 50%, #fecfef 100%); 
-                padding: 2rem; border-radius: 15px; text-align: center; margin: 1rem 0;">
-        <h2 style="color: #8e44ad; margin-bottom: 1rem;">🔐 ACCESO ADMINISTRATIVO</h2>
-        <p style="color: #2c3e50; font-size: 1.1rem; margin-bottom: 0;">
-            Para editar productos se requiere autenticación de administrador
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    with st.form("login_form"):
-        col_login1, col_login2, col_login3 = st.columns([1, 2, 1])
-        
-        with col_login2:
-            usuario = st.text_input("👤 Usuario:", placeholder="Ingresa tu usuario")
-            password = st.text_input("🔑 Contraseña:", type="password", placeholder="Ingresa tu contraseña")
-            
-            col_btn_login = st.columns([1, 2, 1])
-            with col_btn_login[1]:
-                submit_login = st.form_submit_button("🔓 INICIAR SESIÓN", type="primary")
-            
-            if submit_login:
-                if usuario and password:
-                    if verificar_credenciales(usuario, password):
-                        st.session_state.admin_autenticado = True
-                        st.session_state.usuario_admin = usuario
-                        st.success("✅ ¡Acceso concedido! Redirigiendo...")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("❌ Credenciales incorrectas. Inténtalo de nuevo.")
-                        st.info("💡 **Credenciales por defecto:** Usuario: `admin` | Contraseña: `cremeria123`")
-                else:
-                    st.warning("⚠️ Por favor, completa ambos campos.")
-
-def verificar_sesion_admin():
-    """Verificar si hay una sesión administrativa activa"""
-    return st.session_state.get('admin_autenticado', False)
-
-def cerrar_sesion_admin():
-    """Cerrar sesión administrativa"""
-    if 'admin_autenticado' in st.session_state:
-        del st.session_state.admin_autenticado
-    if 'usuario_admin' in st.session_state:
-        del st.session_state.usuario_admin
+# Las funciones de autenticación ahora se importan desde auth_manager.py
 
 # Inicializar sistema de usuarios - DEPRECADO (ahora se usa usuarios.py)
 # crear_tabla_usuarios()
@@ -136,6 +110,10 @@ def actualizar_base_datos_productos_granel():
         cursor.execute("ALTER TABLE productos ADD COLUMN stock_minimo INTEGER DEFAULT 10")
     if 'stock_minimo_kg' not in columns:
         cursor.execute("ALTER TABLE productos ADD COLUMN stock_minimo_kg REAL DEFAULT 0")
+    if 'stock_maximo' not in columns:
+        cursor.execute("ALTER TABLE productos ADD COLUMN stock_maximo INTEGER DEFAULT 30")
+    if 'stock_maximo_kg' not in columns:
+        cursor.execute("ALTER TABLE productos ADD COLUMN stock_maximo_kg REAL DEFAULT 0")
     if 'categoria' not in columns:
         cursor.execute("ALTER TABLE productos ADD COLUMN categoria TEXT DEFAULT 'cremeria'")
     
@@ -161,6 +139,8 @@ CREATE TABLE IF NOT EXISTS productos (
     stock_kg REAL DEFAULT 0,
     stock_minimo INTEGER DEFAULT 10,
     stock_minimo_kg REAL DEFAULT 0,
+    stock_maximo INTEGER DEFAULT 30,
+    stock_maximo_kg REAL DEFAULT 0,
     categoria TEXT DEFAULT 'cremeria'
 )
 ''')
@@ -186,7 +166,7 @@ if 'precio_mayoreo_3' not in columns:
 conn.commit()
 
 def agregar_producto(codigo, nombre, precio_compra, precio_normal, precio_mayoreo_1, precio_mayoreo_2, precio_mayoreo_3, 
-                    stock, tipo_venta, precio_por_kg, peso_unitario, stock_kg, stock_minimo, stock_minimo_kg, categoria, codigo_original=None):
+                    stock, tipo_venta, precio_por_kg, peso_unitario, stock_kg, stock_minimo, stock_minimo_kg, stock_maximo, stock_maximo_kg, categoria, codigo_original=None):
     """Agregar o actualizar producto con soporte para granel y peso unitario"""
     
     # DEBUG: Imprimir valores recibidos
@@ -211,16 +191,26 @@ def agregar_producto(codigo, nombre, precio_compra, precio_normal, precio_mayore
     cursor.execute('''
         INSERT OR REPLACE INTO productos 
         (codigo, nombre, precio_compra, precio_normal, precio_mayoreo_1, precio_mayoreo_2, precio_mayoreo_3, 
-         stock, tipo_venta, precio_por_kg, peso_unitario, stock_kg, stock_minimo, stock_minimo_kg, categoria) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         stock, tipo_venta, precio_por_kg, peso_unitario, stock_kg, stock_minimo, stock_minimo_kg, stock_maximo, stock_maximo_kg, categoria) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (codigo, nombre, precio_compra, precio_normal, precio_mayoreo_1, precio_mayoreo_2, precio_mayoreo_3, 
-          stock, tipo_venta, precio_por_kg, peso_unitario, stock_kg, stock_minimo, stock_minimo_kg, categoria))
+          stock, tipo_venta, precio_por_kg, peso_unitario, stock_kg, stock_minimo, stock_minimo_kg, stock_maximo, stock_maximo_kg, categoria))
     
     print(f"  > Haciendo commit...")
     conn.commit()
     # Forzar flush al disco
     cursor.execute("PRAGMA wal_checkpoint(FULL)")
-    print(f"  > ✅ Producto guardado exitosamente\n")
+    print(f"  > ✅ Producto guardado en SQLite\n")
+    
+    # 🔄 SINCRONIZACIÓN AUTOMÁTICA A SUPABASE
+    if sync.is_online():
+        print(f"  > 🌐 Sincronizando a Supabase...")
+        if sync.auto_sync_after_save(codigo):
+            print(f"  > ✅ Producto sincronizado a Supabase exitosamente")
+        else:
+            print(f"  > ⚠️ No se pudo sincronizar a Supabase")
+    else:
+        print(f"  > 📴 Sin conexión - Producto guardado solo localmente")
 
 def eliminar_producto(codigo):
     cursor.execute("DELETE FROM productos WHERE codigo = ?", (codigo,))
@@ -377,6 +367,8 @@ def cargar_datos_producto_con_estructura(codigo_producto):
             'stock_kg': convertir_float_seguro(producto_dict.get('stock_kg')),
             'stock_minimo': convertir_int_seguro(producto_dict.get('stock_minimo'), 10),
             'stock_minimo_kg': convertir_float_seguro(producto_dict.get('stock_minimo_kg')),
+            'stock_maximo': convertir_int_seguro(producto_dict.get('stock_maximo'), 30),
+            'stock_maximo_kg': convertir_float_seguro(producto_dict.get('stock_maximo_kg')),
             'modo_edicion': True,
             'producto_original': str(producto_dict.get('codigo', ''))
         }
@@ -430,7 +422,9 @@ def mostrar():
     
     with col_header1:
         if es_admin:
-            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | Permisos de edición activos")
+            # Obtener tiempo restante usando función centralizada
+            horas_restantes, minutos_restantes = obtener_tiempo_restante()
+            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | Sesión: {horas_restantes}h {minutos_restantes}m restantes")
         else:
             st.info("👀 **Modo Solo Lectura** - Los productos se muestran en modo consulta únicamente")
     
@@ -448,7 +442,7 @@ def mostrar():
     
     # Mostrar formulario de login si se solicita
     if not es_admin and st.session_state.get('mostrar_login', False):
-        mostrar_formulario_login()
+        mostrar_formulario_login("PRODUCTOS")
         st.markdown("---")
         
         # Botón para cancelar login
@@ -460,6 +454,59 @@ def mostrar():
         
         # No mostrar el resto del contenido mientras se muestra el login
         return
+    
+    # 🔄 PANEL DE SINCRONIZACIÓN (Solo para admins)
+    if es_admin:
+        with st.expander("🔄 Sincronización SQLite ↔️ Supabase", expanded=False):
+            # Verificar estado de conexión
+            is_online = sync.is_online()
+            
+            col_sync_status, col_sync_actions = st.columns([2, 1])
+            
+            with col_sync_status:
+                if is_online:
+                    st.success("✅ **Conectado a Supabase** - Sincronización automática activa")
+                else:
+                    st.warning("📴 **Sin conexión a Supabase** - Trabajando en modo offline (SQLite local)")
+            
+            with col_sync_actions:
+                if st.button("🔄 Verificar Conexión", key="check_connection"):
+                    if sync.is_online():
+                        st.success("✅ Conexión verificada")
+                    else:
+                        st.error("❌ Sin conexión")
+                    st.rerun()
+            
+            if is_online:
+                st.markdown("---")
+                st.subheader("🔄 Opciones de Sincronización Manual")
+                
+                col_sync1, col_sync2 = st.columns(2)
+                
+                with col_sync1:
+                    st.markdown("**📤 Subir a Supabase:**")
+                    if st.button("⬆️ Sincronizar Todo Local → Supabase", key="sync_all_to_supabase", type="primary"):
+                        with st.spinner("Sincronizando productos a Supabase..."):
+                            result = sync.sync_all_productos_to_supabase()
+                            if 'error' in result:
+                                st.error(f"❌ Error: {result['error']}")
+                            else:
+                                st.success(f"✅ Sincronizados: {result['success']} | ❌ Fallidos: {result['failed']}")
+                        st.rerun()
+                
+                with col_sync2:
+                    st.markdown("**📥 Descargar desde Supabase:**")
+                    if st.button("⬇️ Sincronizar Todo Supabase → Local", key="sync_all_from_supabase", type="secondary"):
+                        with st.spinner("Sincronizando productos desde Supabase..."):
+                            result = sync.sync_all_productos_from_supabase()
+                            if 'error' in result:
+                                st.error(f"❌ Error: {result['error']}")
+                            else:
+                                st.success(f"✅ Sincronizados: {result['success']} | ❌ Fallidos: {result['failed']}")
+                        st.rerun()
+                
+                st.markdown("---")
+                st.caption("💡 **Sincronización automática:** Los productos se sincronizan automáticamente a Supabase después de cada guardado cuando hay conexión a internet.")
 
     # CSS para cambio automático
     st.markdown("""
@@ -527,6 +574,10 @@ def mostrar():
         st.session_state['stock_minimo_input'] = st.session_state.form_data.get('stock_minimo', 10)
     if 'stock_minimo_kg_input' not in st.session_state:
         st.session_state['stock_minimo_kg_input'] = st.session_state.form_data.get('stock_minimo_kg', 0.0)
+    if 'stock_maximo_input' not in st.session_state:
+        st.session_state['stock_maximo_input'] = st.session_state.form_data.get('stock_maximo', 30)
+    if 'stock_maximo_kg_input' not in st.session_state:
+        st.session_state['stock_maximo_kg_input'] = st.session_state.form_data.get('stock_maximo_kg', 0.0)
     if 'precio_mayoreo_1_input' not in st.session_state:
         st.session_state['precio_mayoreo_1_input'] = st.session_state.form_data.get('precio_mayoreo_1', 0)
     if 'precio_mayoreo_2_input' not in st.session_state:
@@ -884,8 +935,9 @@ def mostrar():
             if tipo_venta == "unidad":
                 precio_compra = st.number_input(
                     "💰 Precio de Compra", 
-                    min_value=0, 
-                    step=1,
+                    min_value=0.0, 
+                    step=0.01,
+                    format="%.2f",
                     help="Precio al que compraste el producto",
                     disabled=not es_admin,
                     key="precio_compra_input"
@@ -907,8 +959,9 @@ def mostrar():
             # PRODUCTOS POR UNIDAD
             precio_normal = st.number_input(
                 "💸 Precio de Venta por Unidad", 
-                min_value=0, 
-                step=1,
+                min_value=0.0, 
+                step=0.01,
+                format="%.2f",
                 disabled=not es_admin,
                 key="precio_normal_input"
             )
@@ -929,7 +982,8 @@ def mostrar():
                 precio_compra_kg = st.number_input(
                     "💰 Precio Compra por Kg", 
                     min_value=0.0,
-                    step=1.00,
+                    step=0.01,
+                    format="%.2f",
                     disabled=not es_admin,
                     key="precio_compra_input"
                 )
@@ -938,7 +992,8 @@ def mostrar():
                 precio_por_kg = st.number_input(
                     "💵 Precio Venta por Kg", 
                     min_value=0.0,
-                    step=1.00,
+                    step=0.01,
+                    format="%.2f",
                     disabled=not es_admin,
                     key="precio_por_kg_input"
                 )
@@ -988,8 +1043,9 @@ def mostrar():
         with col_mayoreo1:
             precio_mayoreo_1 = st.number_input(
                 f"💼 Mayoreo 1 (5% desc.){' (Kg)' if tipo_venta == 'granel' else ''}",
-                min_value=0.0 if tipo_venta == 'granel' else 0,
-                step=1.00 if tipo_venta == 'granel' else 1,
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
                 disabled=not es_admin,
                 help=f"Auto-llenado con 5% desc.: ${sugerido_1}" if precio_base > 0 else "Ingresa precio de mayoreo manualmente",
                 key="precio_mayoreo_1_input"
@@ -998,8 +1054,9 @@ def mostrar():
         with col_mayoreo2:
             precio_mayoreo_2 = st.number_input(
                 f"💼 Mayoreo 2 (8% desc.){' (Kg)' if tipo_venta == 'granel' else ''}",
-                min_value=0.0 if tipo_venta == 'granel' else 0,
-                step=1.00 if tipo_venta == 'granel' else 1,
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
                 disabled=not es_admin,
                 help=f"Auto-llenado con 8% desc.: ${sugerido_2}" if precio_base > 0 else "Ingresa precio de mayoreo manualmente",
                 key="precio_mayoreo_2_input"
@@ -1008,8 +1065,9 @@ def mostrar():
         with col_mayoreo3:
             precio_mayoreo_3 = st.number_input(
                 f"💼 Mayoreo 3 (10% desc.){' (Kg)' if tipo_venta == 'granel' else ''}",
-                min_value=0.0 if tipo_venta == 'granel' else 0,
-                step=1.00 if tipo_venta == 'granel' else 1,
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
                 disabled=not es_admin,
                 help=f"Auto-llenado con 10% desc.: ${sugerido_3}" if precio_base > 0 else "Ingresa precio de mayoreo manualmente",
                 key="precio_mayoreo_3_input"
@@ -1092,10 +1150,20 @@ def mostrar():
                     disabled=not es_admin,
                     key="stock_minimo_input"
                 )
+                
+                stock_maximo = st.number_input(
+                    "🎯 Stock Máximo (unidades)", 
+                    min_value=0, 
+                    step=1,
+                    disabled=not es_admin,
+                    key="stock_maximo_input",
+                    help="Capacidad máxima de inventario para este producto"
+                )
             else:
                 # Para productos a granel, mantener el stock en unidades si existe
                 stock = st.session_state.form_data.get('stock', 0)
                 stock_minimo = st.session_state.form_data.get('stock_minimo', 0)
+                stock_maximo = st.session_state.form_data.get('stock_maximo', 30)
         
         with col_inv2:
             if tipo_venta == "granel":
@@ -1116,10 +1184,21 @@ def mostrar():
                     disabled=not es_admin,
                     key="stock_minimo_kg_input"
                 )
+                
+                stock_maximo_kg = st.number_input(
+                    "🎯 Stock Máximo (Kg)", 
+                    min_value=0.0, 
+                    step=1.0, 
+                    format="%.3f",
+                    disabled=not es_admin,
+                    key="stock_maximo_kg_input",
+                    help="Capacidad máxima de inventario para este producto"
+                )
             else:
                 # Para productos por unidad, mantener el stock en kg si existe
                 stock_kg = st.session_state.form_data.get('stock_kg', 0.0)
                 stock_minimo_kg = st.session_state.form_data.get('stock_minimo_kg', 0.0)
+                stock_maximo_kg = st.session_state.form_data.get('stock_maximo_kg', 0.0)
         
         # BOTÓN DE SUBMIT (OBLIGATORIO PARA FORMULARIOS)
         st.markdown("---")
@@ -1167,8 +1246,10 @@ def mostrar():
                 precio_normal = st.session_state.get('precio_normal_input', 0)
                 stock = st.session_state.get('stock_input', 0)
                 stock_minimo = st.session_state.get('stock_minimo_input', 10)
+                stock_maximo = st.session_state.get('stock_maximo_input', 30)
                 stock_kg = 0.0
                 stock_minimo_kg = 0.0
+                stock_maximo_kg = 0.0
                 peso_unitario = 0.0
                 precio_por_kg = 0.0
             else:  # granel
@@ -1178,8 +1259,10 @@ def mostrar():
                 precio_normal = precio_por_kg
                 stock = 0
                 stock_minimo = 0
+                stock_maximo = 0
                 stock_kg = st.session_state.get('stock_kg_input', 0.0)
                 stock_minimo_kg = st.session_state.get('stock_minimo_kg_input', 0.0)
+                stock_maximo_kg = st.session_state.get('stock_maximo_kg_input', 0.0)
                 peso_unitario = 0.0
             
             # DEBUG: Imprimir valores antes de guardar
@@ -1256,7 +1339,7 @@ def mostrar():
                         codigo, nombre, precio_compra, precio_normal, 
                         precio_mayoreo_1, precio_mayoreo_2, precio_mayoreo_3,
                         stock, tipo_venta_submit, precio_por_kg, peso_unitario, 
-                        stock_kg, stock_minimo, stock_minimo_kg, categoria, codigo_original
+                        stock_kg, stock_minimo, stock_minimo_kg, stock_maximo, stock_maximo_kg, categoria, codigo_original
                     )
                     
                     # IMPORTANTE: Limpiar TODOS los cachés de Streamlit para que otras páginas vean los cambios

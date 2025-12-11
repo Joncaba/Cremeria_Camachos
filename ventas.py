@@ -1,8 +1,20 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
 import time
+
+# Importar sistema de autenticación centralizado
+from auth_manager import verificar_sesion_admin, cerrar_sesion_admin, obtener_tiempo_restante, mostrar_formulario_login
+
+# Importar gestor de sincronización
+try:
+    from sync_manager import get_sync_manager
+    SYNC_AVAILABLE = True
+except ImportError:
+    SYNC_AVAILABLE = False
+    print("sync_manager no disponible")
 
 conn = sqlite3.connect("pos_cremeria.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -437,6 +449,28 @@ def aplicar_estilos_custom():
             box-shadow: 0 0 25px rgba(102, 126, 234, 0.8);
             transform: scale(1);
         }
+        50% {
+            box-shadow: 0 0 40px rgba(102, 126, 234, 1);
+            transform: scale(1.02);
+        }
+    }
+    
+    /* ESTILO ESPECIAL PARA CAMPO DE CÓDIGO - SIEMPRE RESALTADO */
+    input[aria-label="Código de Barras"],
+    input[placeholder*="Escanea"] {
+        border: 3px solid #00b894 !important;
+        box-shadow: 0 0 15px rgba(0, 184, 148, 0.5) !important;
+        background: #f0fff4 !important;
+        font-size: 1.3rem !important;
+        font-weight: bold !important;
+        animation: pulse-ready 2s infinite;
+    }
+    
+    @keyframes pulse-ready {
+        0%, 100% {
+            box-shadow: 0 0 15px rgba(0, 184, 148, 0.5);
+            border-color: #00b894;
+        }
         50% { 
             box-shadow: 0 0 35px rgba(102, 126, 234, 1);
             transform: scale(1.02);
@@ -553,9 +587,10 @@ conn.commit()
 def parsear_codigo_bascula(codigo_completo):
     """
     Parsear tickets con múltiples productos.
-    Formato: 13 dígitos por producto (9 código + 4 valor donde último dígito es checksum)
-    Para productos a granel: primeros 9 dígitos = código, siguientes 3 dígitos = gramos, último = control
-    Ejemplo: 200006500 4553 → código 200006500, peso 455 gramos (ignorando último dígito)
+    Formato: 13 dígitos por producto (9 código + 3 peso + 1 checksum)
+    Para productos a granel: primeros 9 dígitos = código, siguientes 3 dígitos = peso en decagramos, último = checksum
+    Ejemplo: 200014001 1100 → código 200014001, peso 110 decagramos = 1100 gramos = 1.100 kg (ignora último 0)
+    Ejemplo: 200000100 0270 + checksum 4 → código 200000100, peso 027 decagramos = 270 gramos = 0.270 kg
     Retorna: [(codigo, valor_en_gramos), ...]
     """
     if not codigo_completo or len(codigo_completo) < 13:
@@ -569,9 +604,20 @@ def parsear_codigo_bascula(codigo_completo):
     for i in range(num_productos):
         inicio = i * 13
         codigo_prod = codigo_completo[inicio:inicio+9]  # 9 dígitos para código
-        valor_str = codigo_completo[inicio+9:inicio+12]  # Solo 3 dígitos (ignora el 4to que es checksum)
+        valor_str = codigo_completo[inicio+9:inicio+12]  # 3 dígitos (ignorar el 4to que es checksum)
+        checksum = codigo_completo[inicio+12:inicio+13]  # El dígito checksum
+        
+        # Debug: imprimir qué se está extrayendo
+        print(f"Producto {i+1}: código='{codigo_prod}', valor_str='{valor_str}', checksum='{checksum}', segmento completo='{codigo_completo[inicio:inicio+13]}'")
+        
         try:
-            valor = int(valor_str)
+            valor_int = int(valor_str)
+            # Si el valor es >= 200, ya está en gramos directamente
+            # Si el valor es < 200, está en decagramos (multiplicar por 10)
+            if valor_int >= 200:
+                valor = valor_int  # 270 = 270 gramos
+            else:
+                valor = valor_int * 10  # 110 = 1100 gramos
             productos.append((codigo_prod, valor))
         except ValueError:
             continue
@@ -744,6 +790,70 @@ def mostrar():
     # Aplicar estilos personalizados
     aplicar_estilos_custom()
     
+    # SCRIPT GLOBAL PARA MANTENER FOCUS EN CAMPO DE CÓDIGO
+    components.html(
+        """
+        <script>
+        (function() {
+            let focusInterval;
+            let clickHandlerAdded = false;
+            
+            function enfocarCampoCodigo() {
+                const doc = window.parent.document;
+                const input = doc.querySelector('input[aria-label="Código de Barras"]') || 
+                             doc.querySelector('input[placeholder*="ESCANEA"]') ||
+                             doc.querySelectorAll('input[type="text"]')[0];
+                
+                if (input && document.activeElement !== input) {
+                    input.focus();
+                    return true;
+                }
+                return false;
+            }
+            
+            function agregarClickHandler() {
+                if (clickHandlerAdded) return;
+                
+                const doc = window.parent.document;
+                const paso1 = doc.getElementById('paso1-seccion');
+                
+                if (paso1) {
+                    paso1.addEventListener('click', enfocarCampoCodigo);
+                    doc.addEventListener('click', function(e) {
+                        // Si el click no es en un input, select o button, enfocar el campo de código
+                        if (!e.target.matches('input, select, button, textarea, a')) {
+                            enfocarCampoCodigo();
+                        }
+                    });
+                    clickHandlerAdded = true;
+                }
+            }
+            
+            // Intentar enfocar cada 100ms durante los primeros 3 segundos
+            focusInterval = setInterval(() => {
+                if (enfocarCampoCodigo()) {
+                    agregarClickHandler();
+                }
+            }, 100);
+            
+            setTimeout(() => {
+                clearInterval(focusInterval);
+                agregarClickHandler();
+                enfocarCampoCodigo();
+            }, 3000);
+            
+            // También enfocar cuando la página se vuelve visible
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) {
+                    setTimeout(enfocarCampoCodigo, 100);
+                }
+            });
+        })();
+        </script>
+        """,
+        height=0
+    )
+    
     # Título principal con vaca - más compacto
     st.markdown("""
     <div class="titulo-principal">
@@ -772,37 +882,129 @@ def mostrar():
     </div>
     """, unsafe_allow_html=True)
     
-    # Sección de productos - título más compacto
+    # Mostrar mensaje de éxito si se finalizó una venta
+    if st.session_state.get('mostrar_mensaje_exito', False):
+        total_venta = st.session_state.get('total_venta', 0)
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); padding: 2rem; border-radius: 25px; text-align: center; color: white; font-size: 2rem; font-weight: bold; margin: 2rem 0; box-shadow: 0 15px 50px rgba(0,184,148,0.4); animation: slideIn 0.5s ease-out;">
+            🎉 ¡VENTA REGISTRADA EXITOSAMENTE! 🎉<br>
+            <div style="font-size: 1.5rem; margin-top: 1rem;">
+                💰 Total: {formatear_moneda(total_venta)}
+            </div>
+        </div>
+        <style>
+        @keyframes slideIn {{
+            from {{ opacity: 0; transform: translateY(-20px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        </style>
+        """, unsafe_allow_html=True)
+        st.balloons()
+        
+        # Limpiar el flag después de mostrar
+        st.session_state['mostrar_mensaje_exito'] = False
+        if 'total_venta' in st.session_state:
+            del st.session_state['total_venta']
+    
+    # Sección de productos - título más compacto con ID para click handler
     st.markdown("""
-    <div style="background: linear-gradient(135deg, #83b300 0%, #00a085 100%); padding: .5rem; border-radius: 16px; margin: 0.8rem 0;">
+    <div id="paso1-seccion" style="background: linear-gradient(135deg, #83b300 0%, #00a085 100%); padding: .5rem; border-radius: 16px; margin: 0.8rem 0;">
         <h2 style="color: white; text-align: center; margin-bottom: 0.8rem; font-size: 1.6rem;">📦 PASO 1: AGREGAR PRODUCTOS</h2>
     </div>
     """, unsafe_allow_html=True)
     
     col_codigo, col_cantidad = st.columns([2, 1])
     
+    # Inicializar contador para forzar recreación del widget
+    if 'codigo_widget_counter' not in st.session_state:
+        st.session_state.codigo_widget_counter = 0
+    
     with col_codigo:
         st.markdown("#### 🔍 Código de Barras")
-        # Preparar valor inicial para el input: si se solicitó limpiar, pasar value='' sin modificar el key directamente
-        if st.session_state.get('limpiar_codigo'):
-            initial_codigo = ''
+        
+        # Sistema de limpieza mejorado: usar un key dinámico para forzar recreación
+        if st.session_state.get('limpiar_codigo', False):
+            st.session_state.codigo_widget_counter += 1
             st.session_state['limpiar_codigo'] = False
-        else:
-            initial_codigo = st.session_state.get('codigo_input', '')
-
+        
+        # Usar key dinámico que cambia cuando se limpia
+        widget_key = f"codigo_input_{st.session_state.codigo_widget_counter}"
+        
+        # Indicador visual de que el campo está listo
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); 
+                    padding: 0.3rem 1rem; 
+                    border-radius: 8px; 
+                    text-align: center; 
+                    color: white; 
+                    font-size: 0.9rem; 
+                    font-weight: bold; 
+                    margin-bottom: 0.5rem;
+                    animation: blink 1.5s infinite;">
+            ✨ LISTO PARA ESCANEAR ✨
+        </div>
+        <style>
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
         codigo = st.text_input(
             "Código de Barras",
-            value=initial_codigo,
-            placeholder="Escanea o ingresa el código de barras del producto",
+            value="",  # Siempre vacío para nuevos widgets
+            placeholder="👉 ESCANEA AQUÍ o ingresa código",
             label_visibility="collapsed",
-            key="codigo_input"
+            key=widget_key,
+            help="Campo activo - Escanea directamente aquí"
         )
+    
+    # INYECTAR AUTOFOCUS DIRECTAMENTE EN EL INPUT
+    components.html(
+        """
+        <script>
+        const interval = setInterval(() => {
+            const parentDoc = window.parent.document;
+            const input = parentDoc.querySelector('input[aria-label="Código de Barras"]') || 
+                         parentDoc.querySelector('input[placeholder*="ESCANEA"]');
+            
+            if (input) {
+                input.setAttribute('autofocus', 'autofocus');
+                input.focus();
+                input.click();
+                clearInterval(interval);
+            }
+        }, 50);
+        
+        // Limpiar después de 3 segundos
+        setTimeout(() => clearInterval(interval), 3000);
+        </script>
+        """,
+        height=0
+    )
     
     # DETECCIÓN DE TICKETS
     es_ticket = False
     if codigo and len(codigo) >= 13 and len(codigo) % 13 == 0:
         es_ticket = True
         productos_ticket = parsear_codigo_bascula(codigo)
+        
+        # Solución simple: ignorar si es exactamente 13 dígitos y ya hay algo en session_state esperando más
+        # El escáner envía datos incrementalmente, así que si detectamos 13 dígitos, podría ser parcial
+        if len(codigo) == 13:
+            # Guardar y esperar a ver si llegan más dígitos
+            if 'esperando_ticket_completo' not in st.session_state:
+                st.session_state['esperando_ticket_completo'] = codigo
+                st.info("⏳ Escaneando ticket...")
+                productos_ticket = []  # No procesar aún
+            elif st.session_state['esperando_ticket_completo'] != codigo:
+                # Diferente código, resetear
+                st.session_state['esperando_ticket_completo'] = codigo
+                productos_ticket = []
+        else:
+            # Más de 13 dígitos, es el ticket completo o múltiples productos
+            st.session_state.pop('esperando_ticket_completo', None)
         
         if productos_ticket:
             st.markdown(f"""
@@ -811,31 +1013,59 @@ def mostrar():
                 <div style="font-size: 1.2rem; margin-top: 0.5rem;">📦 {len(productos_ticket)} producto(s)</div>
             </div>
             """, unsafe_allow_html=True)
-            # Auto-process ticket once per ticket to avoid requiring the button
+            
+            # Procesar automáticamente solo UNA VEZ
             ultimo = st.session_state.get('ultimo_ticket_procesado')
+            print(f"DEBUG: Verificando ticket - ultimo={ultimo}, codigo={codigo}, son iguales={ultimo==codigo}")
             if ultimo != codigo:
-                # ensure carrito exists
+                print(f"✨ ENTRANDO AL BLOQUE DE PROCESAMIENTO - Primera vez para este ticket")
+                # Marcar como procesado INMEDIATAMENTE para evitar re-procesamiento
+                st.session_state['ultimo_ticket_procesado'] = codigo
+                
+                # Asegurar que el carrito existe
                 if 'carrito' not in st.session_state:
                     st.session_state.carrito = []
 
+                # Debug: guardar códigos parseados en session_state para verlos después
+                st.session_state['debug_ticket'] = [(c, v) for c, v in productos_ticket]
+
                 agregados = 0
                 no_encontrados = []
+                
+                # Inicializar set de duplicados solo si es un ticket nuevo
+                if 'codigos_ya_agregados_ticket' not in st.session_state:
+                    st.session_state['codigos_ya_agregados_ticket'] = set()
+                    st.session_state['ultimo_ticket_id'] = codigo
+                elif st.session_state.get('ultimo_ticket_id') != codigo:
+                    # Nuevo ticket diferente, resetear el set
+                    st.session_state['codigos_ya_agregados_ticket'] = set()
+                    st.session_state['ultimo_ticket_id'] = codigo
+                
+                codigos_ya_agregados = st.session_state['codigos_ya_agregados_ticket']
 
                 for codigo_prod, valor in productos_ticket:
-                    # Intentar buscar con código de 9 dígitos, luego 8, 7, 6... hasta encontrar
+                    # Intentar buscar con código de diferentes longitudes
                     prod = None
+                    codigo_real_encontrado = None
+                    
                     for longitud in [9, 8, 7, 6, 5]:
                         codigo_intento = codigo_prod[:longitud]
                         prod = obtener_producto_por_codigo(codigo_intento)
                         if prod:
+                            info = obtener_informacion_producto(prod)
+                            codigo_real_encontrado = info['codigo']
+                            print(f"Encontrado producto: {info['nombre']} con código real: {codigo_real_encontrado}")
                             break
                     
+                    # Verificar si ya agregamos este producto (por código real)
+                    if codigo_real_encontrado and codigo_real_encontrado in codigos_ya_agregados:
+                        print(f"⚠️ DUPLICADO DETECTADO: {codigo_real_encontrado} - saltando...")
+                        continue
+                    
                     if prod:
-                        info = obtener_informacion_producto(prod)
-
-                        # calcular opciones de cantidad
-                        cant_100 = valor // 100
-                        cant_1000 = valor // 1000
+                        # Marcar como agregado ANTES de procesarlo
+                        codigos_ya_agregados.add(codigo_real_encontrado)
+                        print(f"✓ Agregando al carrito: {info['nombre']} - Set actual: {codigos_ya_agregados}")
 
                         if info['tipo_venta'] == 'granel':
                             peso_kg = valor / 1000.0
@@ -854,78 +1084,13 @@ def mostrar():
                                 st.session_state.carrito.append(item)
                                 agregados += 1
                         else:
-                            cant = cant_100
-                            # Heurística simple: si valor divisible por 1000 preferir //1000
-                            if valor % 1000 == 0 and cant_1000 > 0:
-                                cant = cant_1000
-                            if cant == 0:
-                                cant = 1
-
-                            precio = obtener_precio_por_tipo(prod, "Normal")
-                            total = precio * cant
-                            if info['stock'] >= cant:
-                                item = {
-                                    'codigo': info['codigo'],
-                                    'nombre': info['nombre'],
-                                    'cantidad': cant,
-                                    'peso': 0,
-                                    'precio_unitario': precio,
-                                    'total': total,
-                                    'tipo_venta': 'unidad'
-                                }
-                                st.session_state.carrito.append(item)
-                                agregados += 1
-                    else:
-                        no_encontrados.append(codigo_prod)
-
-                # mark as processed and request clearing the input (do NOT modify widget state after creation)
-                st.session_state['ultimo_ticket_procesado'] = codigo
-                st.session_state['limpiar_codigo'] = True
-
-                if agregados > 0:
-                    st.success(f"✅ {agregados} productos agregados automáticamente")
-                    safe_rerun()
-                if no_encontrados:
-                    st.warning(f"⚠️ No encontrados: {', '.join(no_encontrados)}")
-
-            # Fallback manual button (kept for safety)
-            if st.button("✅ PROCESAR TICKET", type="primary", width='stretch'):
-                # user-triggered processing (same logic as automatic)
-                agregados = 0
-                no_encontrados = []
-                for codigo_prod, valor in productos_ticket:
-                    # Intentar buscar con código de 9 dígitos, luego 8, 7, 6... hasta encontrar
-                    prod = None
-                    for longitud in [9, 8, 7, 6, 5]:
-                        codigo_intento = codigo_prod[:longitud]
-                        prod = obtener_producto_por_codigo(codigo_intento)
-                        if prod:
-                            break
-                    
-                    if prod:
-                        info = obtener_informacion_producto(prod)
-                        if info['tipo_venta'] == 'granel':
-                            peso_kg = valor / 1000.0
-                            precio_kg = obtener_precio_granel_por_tipo(prod, "Normal")
-                            total = precio_kg * peso_kg
-                            if info['stock_kg'] >= peso_kg:
-                                item = {
-                                    'codigo': info['codigo'],
-                                    'nombre': f"{info['nombre']} ({peso_kg:.3f} Kg)",
-                                    'cantidad': 1,
-                                    'peso': peso_kg,
-                                    'precio_unitario': precio_kg,
-                                    'total': total,
-                                    'tipo_venta': 'granel'
-                                }
-                                st.session_state.carrito.append(item)
-                                agregados += 1
-                        else:
+                            # Calcular cantidad
                             cant = valor // 100
                             if valor % 1000 == 0 and (valor // 1000) > 0:
                                 cant = valor // 1000
                             if cant == 0:
                                 cant = 1
+
                             precio = obtener_precio_por_tipo(prod, "Normal")
                             total = precio * cant
                             if info['stock'] >= cant:
@@ -943,48 +1108,53 @@ def mostrar():
                     else:
                         no_encontrados.append(codigo_prod)
 
-                st.session_state['ultimo_ticket_procesado'] = codigo
+                # Limpiar el código de entrada completamente
                 st.session_state['limpiar_codigo'] = True
+
                 if agregados > 0:
-                    st.success(f"✅ {agregados} productos agregados")
-                    safe_rerun()
+                    st.success(f"✅ {agregados} productos agregados automáticamente")
+                    # Hacer rerun para limpiar el campo visualmente
+                    st.rerun()
                 if no_encontrados:
                     st.warning(f"⚠️ No encontrados: {', '.join(no_encontrados)}")
     
-    # Verificar si el producto existe y obtener información
+    # Verificar si el producto existe y obtener información (SOLO si NO es ticket)
+    # Si es un ticket, NO mostrar ningún mensaje de producto individual
     producto_info = None
     info_producto = None
-    if codigo and not es_ticket:
-        producto_info = obtener_producto_por_codigo(codigo)
-        if producto_info:
-            info_producto = obtener_informacion_producto(producto_info)
     
-    # Mostrar información del producto encontrado
-    if info_producto:
-        st.markdown(f"""
-        <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; color: white; text-align: center;">
-            <div style="font-size: 1.4rem; font-weight: bold; margin-bottom: 0.5rem;">
-                📦 PRODUCTO ENCONTRADO
+    if not es_ticket:
+        if codigo:
+            producto_info = obtener_producto_por_codigo(codigo)
+            if producto_info:
+                info_producto = obtener_informacion_producto(producto_info)
+        
+        # Mostrar información del producto encontrado
+        if info_producto:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; color: white; text-align: center;">
+                <div style="font-size: 1.4rem; font-weight: bold; margin-bottom: 0.5rem;">
+                    📦 PRODUCTO ENCONTRADO
+                </div>
+                <div style="font-size: 1.8rem; font-weight: bold; color: #fdcb6e;">
+                    {info_producto['nombre']}
+                </div>
+                <div style="font-size: 1.1rem; margin-top: 0.5rem;">
+                    🏷️ Código: {info_producto['codigo']}
+                </div>
             </div>
-            <div style="font-size: 1.8rem; font-weight: bold; color: #fdcb6e;">
-                {info_producto['nombre']}
+            """, unsafe_allow_html=True)
+        elif codigo and len(codigo) > 3:
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #e17055 0%, #d63031 100%); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; color: white; text-align: center;">
+                <div style="font-size: 1.4rem; font-weight: bold; margin-bottom: 0.5rem;">
+                    ❌ PRODUCTO NO ENCONTRADO
+                </div>
+                <div style="font-size: 1.1rem;">
+                    🔍 Código buscado: {codigo}
+                </div>
             </div>
-            <div style="font-size: 1.1rem; margin-top: 0.5rem;">
-                🏷️ Código: {info_producto['codigo']}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    elif codigo and len(codigo) > 3 and not es_ticket:
-        st.markdown(f"""
-        <div style="background: linear-gradient(135deg, #e17055 0%, #d63031 100%); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; color: white; text-align: center;">
-            <div style="font-size: 1.4rem; font-weight: bold; margin-bottom: 0.5rem;">
-                ❌ PRODUCTO NO ENCONTRADO
-            </div>
-            <div style="font-size: 1.1rem;">
-                🔍 Código buscado: {codigo}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
     # Si no hay código ingresado, mostrar listado de ventas realizadas hoy
     elif not codigo:
         try:
@@ -1032,7 +1202,7 @@ def mostrar():
             df_display["Ventas"] = 1
             # Reordenar columnas
             df_display = df_display[["Venta", "Fecha", "Hora", "Total", "Ventas"]]
-            st.dataframe(df_display.reset_index(drop=True), width='stretch')
+            st.dataframe(df_display.reset_index(drop=True), use_container_width=True)
         else:
             st.info("No se registraron ventas hoy.")
     
@@ -1167,6 +1337,9 @@ def mostrar():
                         st.info(f"DEBUG append(manual-granel): {item}")
                         st.session_state.carrito.append(item)
                         
+                        # Limpiar campos de entrada
+                        st.session_state['limpiar_codigo'] = True
+                        
                         # Mensaje de éxito mejorado
                         st.markdown(f"""
                         <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); padding: .5rem; border-radius: 15px; text-align: center; color: white; font-size: 1.2rem; font-weight: bold; margin: 1rem 0;">
@@ -1206,6 +1379,9 @@ def mostrar():
                         st.info(f"DEBUG append(manual-unidad): {item}")
                         st.session_state.carrito.append(item)
                         
+                        # Limpiar campos de entrada
+                        st.session_state['limpiar_codigo'] = True
+                        
                         # Mensaje de éxito mejorado
                         st.markdown(f"""
                         <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); padding: .5rem; border-radius: 15px; text-align: center; color: white; font-size: 1.2rem; font-weight: bold; margin: 1rem 0;">
@@ -1228,6 +1404,11 @@ def mostrar():
     # Mostrar carrito - título más compacto y color cambiado
     if st.session_state.carrito:
         st.markdown("---")
+        
+        # Mostrar debug de ticket si existe
+        if 'debug_ticket' in st.session_state and st.session_state.debug_ticket:
+            st.info(f"🔍 DEBUG - Códigos parseados del último ticket: {st.session_state.debug_ticket}")
+        
         st.markdown("""        
         <div style="background: linear-gradient(135deg, #a8d5ba 0%, #90c695 100%); padding: 1.5rem; border-radius: 16px; margin: 0.8rem 0; border: 2px solid #7eb693;">
             <h2 style="color: #1e3a28; text-align: center; margin-bottom: 0.8rem; font-size: 1.6rem;">🛒 CARRITO DE COMPRAS</h2>
@@ -1424,7 +1605,7 @@ def mostrar():
             <div style="display:flex; align-items:center; gap:10px;">
                 <div style="font-size:1.1rem;">👤</div>
                 <div style="font-weight:700;">Tipo de Cliente</div>
-            </div>
+            </div>  
             """, unsafe_allow_html=True)
             cliente_tipo = st.selectbox(
                 "Tipo de Cliente",
@@ -1470,69 +1651,32 @@ def mostrar():
                     pago_credito = st.checkbox("🧾 Crédito", key="credito_final")
 
             else:
-                # Pago único: mostrar las mismas casillas (checkboxes) que en Pago mixto
-                # Usamos keys específicas para el modo único: unico_efectivo, unico_tarjeta, etc.
-                if 'tipo_pago_unico' not in st.session_state:
-                    st.session_state['tipo_pago_unico'] = 'Efectivo'
-
-                opciones = [
-                    ("unico_efectivo", "💵 Efectivo", "Efectivo"),
-                    ("unico_tarjeta", "💳 Tarjeta", "Tarjeta"),
-                    ("unico_transferencia", "🏦 Transferencia", "Transferencia"),
-                    ("unico_credito", "🧾 Crédito", "Crédito"),
-                ]
-
-                col_pago1, col_pago2 = st.columns(2)
-                # Pre-configurar los estados de los checkboxes antes de renderizar según tipo_pago_unico
-                for key, label_with_emoji, label in opciones:
-                    st.session_state.setdefault(key, False)
-                    st.session_state[key] = (st.session_state.get('tipo_pago_unico') == label)
-
-                # Título igual que en Pago mixto (ajustado para ocupar todo el ancho y centrar)
-                st.markdown(
-                    '''
-                    <div style="width:100%; text-align:center; margin-bottom:0.5rem; font-weight:700; font-size:1.05rem;">
-                        Selecciona la forma de pago:
-                    </div>
-                    ''',
-                    unsafe_allow_html=True
+                # Pago único: usar radio buttons para selección exclusiva
+                st.markdown("**Selecciona la forma de pago:**")
+                
+                # Inicializar el tipo de pago seleccionado si no existe
+                if 'tipo_pago_unico_selected' not in st.session_state:
+                    st.session_state.tipo_pago_unico_selected = 'Efectivo'
+                
+                # Radio buttons con opciones de pago
+                pago_seleccionado = st.radio(
+                    "Método de pago",
+                    options=['Efectivo', 'Tarjeta', 'Transferencia', 'Crédito'],
+                    index=['Efectivo', 'Tarjeta', 'Transferencia', 'Crédito'].index(st.session_state.tipo_pago_unico_selected),
+                    format_func=lambda x: {'Efectivo': '💵 Efectivo', 'Tarjeta': '💳 Tarjeta', 'Transferencia': '🏦 Transferencia', 'Crédito': '🧾 Crédito'}[x],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="radio_pago_unico"
                 )
-                # Renderizar en dos columnas igual que pago mixto
-                with col_pago1:
-                    pago_efectivo = st.checkbox(opciones[0][1], value=st.session_state[opciones[0][0]], key=opciones[0][0])
-                    pago_tarjeta = st.checkbox(opciones[1][1], value=st.session_state[opciones[1][0]], key=opciones[1][0])
-
-                with col_pago2:
-                    pago_transferencia = st.checkbox(opciones[2][1], value=st.session_state[opciones[2][0]], key=opciones[2][0])
-                    pago_credito = st.checkbox(opciones[3][1], value=st.session_state[opciones[3][0]], key=opciones[3][0])
-
-                # Detectar cambios y forzar exclusividad: si el usuario marcó alguno, setear tipo_pago_unico y rerun
-                current = {
-                    opciones[0][2]: st.session_state.get(opciones[0][0], False),
-                    opciones[1][2]: st.session_state.get(opciones[1][0], False),
-                    opciones[2][2]: st.session_state.get(opciones[2][0], False),
-                    opciones[3][2]: st.session_state.get(opciones[3][0], False),
-                }
-                prev = st.session_state.get('prev_unico_checks', {})
-                if current != prev:
-                    # buscar cuál fue marcado True recientemente
-                    selected = None
-                    for lbl, val in current.items():
-                        if val and not prev.get(lbl, False):
-                            selected = lbl
-                            break
-                    # si no detectamos cambio desde False->True, escoger el primero True
-                    if not selected:
-                        for lbl, val in current.items():
-                            if val:
-                                selected = lbl
-                                break
-                    if selected:
-                        st.session_state['tipo_pago_unico'] = selected
-                        st.session_state['prev_unico_checks'] = current
-                        safe_rerun()
-                    else:
-                        st.session_state['prev_unico_checks'] = current
+                
+                # Actualizar session state
+                st.session_state.tipo_pago_unico_selected = pago_seleccionado
+                
+                # Convertir selección a variables booleanas para compatibilidad
+                pago_efectivo = (pago_seleccionado == 'Efectivo')
+                pago_tarjeta = (pago_seleccionado == 'Tarjeta')
+                pago_transferencia = (pago_seleccionado == 'Transferencia')
+                pago_credito = (pago_seleccionado == 'Crédito')
 
             # (removed helper emoji row as requested — the selectable checkboxes/buttons are above)
         
@@ -1851,11 +1995,13 @@ def mostrar():
                             if venta_id is None:
                                 venta_id = cursor.lastrowid
                         
-                            # Actualizar stock
+                            # Actualizar stock según tipo de venta
                             if tipo_venta == 'granel':
-                                cursor.execute("UPDATE productos SET stock_kg = stock_kg - ?, stock = stock - ? WHERE codigo = ?", 
-                                             (peso_vendido, item['cantidad'], item['codigo']))
+                                # Para productos a granel, solo restar del stock_kg
+                                cursor.execute("UPDATE productos SET stock_kg = stock_kg - ? WHERE codigo = ?", 
+                                             (peso_vendido, item['codigo']))
                             else:
+                                # Para productos por unidad, solo restar del stock
                                 cursor.execute("UPDATE productos SET stock = stock - ? WHERE codigo = ?", 
                                              (item['cantidad'], item['codigo']))
                         
@@ -1873,25 +2019,82 @@ def mostrar():
                     
                         conn.commit()
                         
-                        # Mensaje de éxito mejorado
-                        st.markdown(f"""
-                        <div style="background: linear-gradient(135deg, #00b894 0%, #00cec9 100%); padding: 3rem; border-radius: 25px; text-align: center; color: white; font-size: 2rem; font-weight: bold; margin: 2rem 0; box-shadow: 0 15px 50px rgba(0,184,148,0.4);">
-                            🎉 ¡VENTA REGISTRADA EXITOSAMENTE! 🎉<br>
-                            <div style="font-size: 1.5rem; margin-top: 1rem;">
-                                💰 Total: {formatear_moneda(total_general)}
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        # Sincronizar con Supabase automáticamente
+                        if SYNC_AVAILABLE:
+                            try:
+                                sync_manager = get_sync_manager()
+                                if sync_manager.is_online():
+                                    # Sincronizar la venta recién registrada
+                                    cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,))
+                                    venta_registrada = cursor.fetchone()
+                                    if venta_registrada:
+                                        venta_dict = {
+                                            'id': venta_registrada[0],
+                                            'fecha': venta_registrada[1],
+                                            'codigo': venta_registrada[2],
+                                            'nombre': venta_registrada[3],
+                                            'cantidad': venta_registrada[4],
+                                            'precio_unitario': venta_registrada[5],
+                                            'total': venta_registrada[6],
+                                            'tipo_cliente': venta_registrada[7],
+                                            'tipos_pago': venta_registrada[8],
+                                            'monto_efectivo': venta_registrada[9],
+                                            'monto_tarjeta': venta_registrada[10],
+                                            'monto_transferencia': venta_registrada[11],
+                                            'monto_credito': venta_registrada[12],
+                                            'fecha_vencimiento_credito': venta_registrada[13],
+                                            'hora_vencimiento_credito': venta_registrada[14],
+                                            'cliente_credito': venta_registrada[15],
+                                            'pagado': venta_registrada[16],
+                                            'alerta_mostrada': venta_registrada[17],
+                                            'peso_vendido': venta_registrada[18],
+                                            'tipo_venta': venta_registrada[19]
+                                        }
+                                        sync_manager.sync_venta_to_supabase(venta_dict)
+                                    
+                                    # Sincronizar el stock actualizado de cada producto vendido
+                                    for item_vendido in productos_vendidos:
+                                        cursor.execute("SELECT * FROM productos WHERE codigo = ?", (item_vendido['codigo'],))
+                                        producto_actualizado = cursor.fetchone()
+                                        if producto_actualizado:
+                                            producto_dict = {
+                                                'codigo': producto_actualizado[0],
+                                                'nombre': producto_actualizado[1],
+                                                'precio_compra': producto_actualizado[2],
+                                                'precio_normal': producto_actualizado[3],
+                                                'precio_mayoreo_1': producto_actualizado[4],
+                                                'precio_mayoreo_2': producto_actualizado[5],
+                                                'precio_mayoreo_3': producto_actualizado[6],
+                                                'stock': producto_actualizado[7],
+                                                'tipo_venta': producto_actualizado[8],
+                                                'precio_por_kg': producto_actualizado[9],
+                                                'peso_unitario': producto_actualizado[10],
+                                                'stock_kg': producto_actualizado[11],
+                                                'stock_minimo': producto_actualizado[12],
+                                                'stock_minimo_kg': producto_actualizado[13],
+                                                'stock_maximo': producto_actualizado[14],
+                                                'stock_maximo_kg': producto_actualizado[15],
+                                                'categoria': producto_actualizado[16]
+                                            }
+                                            sync_manager.sync_producto_to_supabase(producto_dict)
+                            except Exception as sync_error:
+                                print(f"Error en sincronización automática: {sync_error}")
                         
-                        st.balloons()
+                        # Guardar mensaje de éxito para mostrar después del rerun
+                        st.session_state['mostrar_mensaje_exito'] = True
+                        st.session_state['total_venta'] = total_general
                         
-                        # Limpiar carrito
+                        # Limpiar carrito y campos de entrada
                         st.session_state.carrito = []
                         keys_to_remove = [key for key in st.session_state.keys() if key.startswith('editando_')]
                         for key in keys_to_remove:
                             del st.session_state[key]
-                            
-                        time.sleep(2)
+                        
+                        # Marcar que se debe limpiar el código para nueva venta
+                        st.session_state['limpiar_codigo'] = True
+                        st.session_state['venta_finalizada'] = True
+                        
+                        # Rerun inmediato para que el autofocus funcione correctamente
                         st.rerun()
                         
                     except Exception as e:
@@ -2008,7 +2211,7 @@ def mostrar():
                 st.dataframe(
                     df_resumen,
                     hide_index=True,
-                    width='stretch'
+                    use_container_width=True
                 )
                 
                 # Calcular totales
@@ -2154,6 +2357,72 @@ def mostrar():
         // Iniciar después de que se renderice la página
         setTimeout(tryScroll, 300);
         
+        </script>
+        """, unsafe_allow_html=True)
+    
+    # Script para hacer focus automático en el campo de código después de finalizar venta
+    if st.session_state.get('venta_finalizada', False):
+        st.session_state['venta_finalizada'] = False
+        
+        st.markdown("""
+        <script>
+        // Función para hacer focus en el campo de código después de finalizar venta
+        function focusCodigoAfterVenta() {
+            console.log('Intentando hacer focus en campo de código después de venta...');
+            
+            // Buscar el input de código por diferentes métodos
+            const searchMethods = [
+                () => window.parent.document.querySelectorAll('input[aria-label="Código de Barras"]'),
+                () => window.parent.document.querySelectorAll('input[placeholder*="Escanea o ingresa"]'),
+                () => window.parent.document.querySelectorAll('input[type="text"]'),
+                () => document.querySelectorAll('input[aria-label="Código de Barras"]'),
+                () => document.querySelectorAll('input[placeholder*="Escanea o ingresa"]')
+            ];
+            
+            let codigoInput = null;
+            
+            for (let method of searchMethods) {
+                try {
+                    const inputs = method();
+                    if (inputs && inputs.length > 0) {
+                        codigoInput = inputs[0];
+                        console.log('Input encontrado usando método:', method);
+                        break;
+                    }
+                } catch (e) {
+                    console.log('Error en método de búsqueda:', e);
+                }
+            }
+            
+            if (codigoInput) {
+                // Limpiar el campo
+                codigoInput.value = '';
+                
+                // Hacer focus
+                codigoInput.focus();
+                codigoInput.select();
+                
+                // Scroll hacia arriba para que el campo esté visible
+                codigoInput.scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'center'
+                });
+                
+                console.log('✅ Focus establecido en campo de código');
+                return true;
+            } else {
+                console.log('❌ No se encontró el campo de código');
+                return false;
+            }
+        }
+        
+        // Intentar hacer focus múltiples veces con delays crecientes
+        setTimeout(() => focusCodigoAfterVenta(), 100);
+        setTimeout(() => focusCodigoAfterVenta(), 300);
+        setTimeout(() => focusCodigoAfterVenta(), 600);
+        setTimeout(() => focusCodigoAfterVenta(), 1000);
+        setTimeout(() => focusCodigoAfterVenta(), 1500);
+        setTimeout(() => focusCodigoAfterVenta(), 2500);
         </script>
         """, unsafe_allow_html=True)
 

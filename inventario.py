@@ -4,14 +4,22 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 import openpyxl
 import hashlib
 import time
 import unicodedata
 import re
+import config
+from db_adapter import get_db_adapter
+from sync_manager import get_sync_manager
+from auth_manager import verificar_sesion_admin, cerrar_sesion_admin, obtener_tiempo_restante, mostrar_formulario_login
 
 DB_PATH = "pos_cremeria.db"
+
+# Inicializar adaptador de base de datos y sync manager
+db = get_db_adapter()
+sync = get_sync_manager()
 
 # === UTILIDADES DE BÚSQUEDA ===
 
@@ -51,26 +59,30 @@ def crear_tabla_usuarios():
     pass
 
 def hash_password(password):
-    """Crear hash de la contraseña"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Crear hash de la contraseña con salt (igual que streamlit_app.py)"""
+    salt = config.get_password_salt()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
-    """Verificar si las credenciales son correctas"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    password_hash = hash_password(password)
+    """Verificar si las credenciales son correctas usando db_adapter con salt"""
     try:
-        cursor.execute(
-            "SELECT id FROM usuarios_admin WHERE usuario = ? AND password = ?", 
-            (usuario, password_hash)
-        )
-        resultado = cursor.fetchone()
-        return resultado is not None
+        # Calcular hash con salt
+        password_hash = hash_password(password)
+        
+        # Obtener usuario de la base de datos
+        user = db.obtener_usuario(usuario)
+        
+        # Verificar si existe y la contraseña coincide
+        if user and user.get('password') == password_hash:
+            # Verificar si está activo (si existe el campo)
+            if 'activo' in user and user['activo'] == 0:
+                return False
+            return True
+        
+        return False
     except Exception as e:
         print(f"Error al verificar credenciales: {e}")
         return False
-    finally:
-        conn.close()
 
 def crear_admin_por_defecto():
     """Crear usuario administrador por defecto si no existe - DEPRECADA"""
@@ -78,54 +90,7 @@ def crear_admin_por_defecto():
     # Se mantiene solo para compatibilidad
     return False
 
-def mostrar_formulario_login():
-    """Mostrar formulario de login para administradores"""
-    st.markdown("""
-    <div style="background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 50%, #fecfef 100%); 
-                padding: 2rem; border-radius: 15px; text-align: center; margin: 1rem 0;">
-        <h2 style="color: #8e44ad; margin-bottom: 1rem;">🔐 ACCESO ADMINISTRATIVO - INVENTARIO</h2>
-        <p style="color: #2c3e50; font-size: 1.1rem; margin-bottom: 0;">
-            Para gestionar configuraciones de inventario se requiere autenticación de administrador
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    with st.form("login_form_inventario"):
-        col_login1, col_login2, col_login3 = st.columns([1, 2, 1])
-        
-        with col_login2:
-            usuario = st.text_input("👤 Usuario:", placeholder="Ingresa tu usuario")
-            password = st.text_input("🔑 Contraseña:", type="password", placeholder="Ingresa tu contraseña")
-            
-            col_btn_login = st.columns([1, 2, 1])
-            with col_btn_login[1]:
-                submit_login = st.form_submit_button("🔓 INICIAR SESIÓN", type="primary")
-            
-            if submit_login:
-                if usuario and password:
-                    if verificar_credenciales(usuario, password):
-                        st.session_state.admin_inventario_autenticado = True
-                        st.session_state.usuario_admin_inventario = usuario
-                        st.success("✅ ¡Acceso concedido! Redirigiendo...")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("❌ Credenciales incorrectas. Inténtalo de nuevo.")
-                        st.info("💡 **Credenciales por defecto:** Usuario: `admin` | Contraseña: `cremeria123`")
-                else:
-                    st.warning("⚠️ Por favor, completa ambos campos.")
-
-def verificar_sesion_admin():
-    """Verificar si hay una sesión administrativa activa"""
-    return st.session_state.get('admin_inventario_autenticado', False)
-
-def cerrar_sesion_admin():
-    """Cerrar sesión administrativa"""
-    if 'admin_inventario_autenticado' in st.session_state:
-        del st.session_state.admin_inventario_autenticado
-    if 'usuario_admin_inventario' in st.session_state:
-        del st.session_state.usuario_admin_inventario
-
+# Las funciones de autenticación ahora se importan desde auth_manager.py
 # Inicializar sistema de usuarios - DEPRECADO (ahora se usa usuarios.py)
 # crear_tabla_usuarios()
 # admin_creado = crear_admin_por_defecto()
@@ -204,7 +169,7 @@ def crear_tabla_stock_minimo():
         conn.close()
 
 def obtener_productos_stock_bajo():
-    """Obtener productos con stock bajo (menos del 50% del stock mínimo)"""
+    """Obtener productos con stock menor o igual al stock mínimo"""
     conn = sqlite3.connect(DB_PATH)
     
     try:
@@ -214,7 +179,8 @@ def obtener_productos_stock_bajo():
         # Porcentaje ahora se calcula respecto al stock_maximo (capacidad completa)
         # y la cantidad necesaria se calcula como (stock_maximo - stock) para rellenar a capacidad.
         query = """
-        SELECT codigo, nombre, stock, stock_minimo, stock_kg, stock_minimo_kg, tipo_venta, categoria,
+        SELECT codigo, nombre, stock, stock_minimo, stock_maximo, stock_kg, stock_minimo_kg, 
+               stock_maximo_kg, tipo_venta, categoria,
                CASE 
                    WHEN tipo_venta = 'granel' THEN 
                        CASE WHEN stock_maximo_kg > 0 THEN (stock_kg * 100.0 / stock_maximo_kg) ELSE 100 END
@@ -228,13 +194,29 @@ def obtener_productos_stock_bajo():
                precio_compra, precio_normal, precio_por_kg
         FROM productos 
         WHERE (
-            (tipo_venta = 'unidad' AND stock <= (stock_minimo * 0.5) AND stock_minimo > 0) OR
-            (tipo_venta = 'granel' AND stock_kg <= (stock_minimo_kg * 0.5) AND stock_minimo_kg > 0)
+            (tipo_venta = 'unidad' AND stock <= stock_minimo AND stock_minimo > 0) OR
+            (tipo_venta = 'granel' AND stock_kg <= stock_minimo_kg AND stock_minimo_kg > 0)
         )
         ORDER BY categoria, porcentaje_stock ASC
         """
         
         productos_bajo_stock = pd.read_sql_query(query, conn)
+        
+        # Agregar columnas display unificadas
+        if not productos_bajo_stock.empty:
+            productos_bajo_stock['stock_display'] = productos_bajo_stock.apply(
+                lambda row: f"{row['stock_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{int(row['stock'])} unid.",
+                axis=1
+            )
+            productos_bajo_stock['stock_minimo_display'] = productos_bajo_stock.apply(
+                lambda row: f"{row['stock_minimo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{int(row['stock_minimo'])} unid.",
+                axis=1
+            )
+            productos_bajo_stock['stock_maximo_display'] = productos_bajo_stock.apply(
+                lambda row: f"{row['stock_maximo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{int(row['stock_maximo'])} unid.",
+                axis=1
+            )
+        
         return productos_bajo_stock
     except Exception as e:
         print(f"Error al obtener productos con stock bajo: {e}")
@@ -255,6 +237,27 @@ def actualizar_stock_minimo(codigo, nuevo_stock_minimo, nuevo_stock_minimo_kg=No
             cursor.execute("UPDATE productos SET stock_minimo = ? WHERE codigo = ?", (nuevo_stock_minimo, codigo))
         
         conn.commit()
+        
+        # Sincronizar a Supabase automáticamente
+        try:
+            if sync.is_online():
+                cursor.execute("SELECT * FROM productos WHERE codigo = ?", (codigo,))
+                producto = cursor.fetchone()
+                if producto:
+                    producto_dict = {
+                        'codigo': producto[0], 'nombre': producto[1], 'precio_compra': producto[2],
+                        'precio_normal': producto[3], 'precio_mayoreo_1': producto[4],
+                        'precio_mayoreo_2': producto[5], 'precio_mayoreo_3': producto[6],
+                        'stock': producto[7], 'tipo_venta': producto[8], 'precio_por_kg': producto[9],
+                        'peso_unitario': producto[10], 'stock_kg': producto[11],
+                        'stock_minimo': producto[12], 'stock_minimo_kg': producto[13],
+                        'stock_maximo': producto[14], 'stock_maximo_kg': producto[15],
+                        'categoria': producto[16]
+                    }
+                    sync.sync_producto_to_supabase(producto_dict)
+        except Exception as sync_error:
+            print(f"Error en sincronización automática: {sync_error}")
+        
         return True
     except Exception as e:
         print(f"Error al actualizar stock mínimo: {e}")
@@ -276,6 +279,27 @@ def actualizar_stock_maximo(codigo, nuevo_stock_maximo, nuevo_stock_maximo_kg=No
             cursor.execute("UPDATE productos SET stock_maximo = ? WHERE codigo = ?", (nuevo_stock_maximo, codigo))
         
         conn.commit()
+        
+        # Sincronizar a Supabase automáticamente
+        try:
+            if sync.is_online():
+                cursor.execute("SELECT * FROM productos WHERE codigo = ?", (codigo,))
+                producto = cursor.fetchone()
+                if producto:
+                    producto_dict = {
+                        'codigo': producto[0], 'nombre': producto[1], 'precio_compra': producto[2],
+                        'precio_normal': producto[3], 'precio_mayoreo_1': producto[4],
+                        'precio_mayoreo_2': producto[5], 'precio_mayoreo_3': producto[6],
+                        'stock': producto[7], 'tipo_venta': producto[8], 'precio_por_kg': producto[9],
+                        'peso_unitario': producto[10], 'stock_kg': producto[11],
+                        'stock_minimo': producto[12], 'stock_minimo_kg': producto[13],
+                        'stock_maximo': producto[14], 'stock_maximo_kg': producto[15],
+                        'categoria': producto[16]
+                    }
+                    sync.sync_producto_to_supabase(producto_dict)
+        except Exception as sync_error:
+            print(f"Error en sincronización automática: {sync_error}")
+        
         return True
     except Exception as e:
         print(f"Error al actualizar stock máximo: {e}")
@@ -297,6 +321,27 @@ def actualizar_stock_producto(codigo, nuevo_stock, nuevo_stock_kg=None):
             cursor.execute("UPDATE productos SET stock = ? WHERE codigo = ?", (nuevo_stock, codigo))
         
         conn.commit()
+        
+        # Sincronizar a Supabase automáticamente
+        try:
+            if sync.is_online():
+                cursor.execute("SELECT * FROM productos WHERE codigo = ?", (codigo,))
+                producto = cursor.fetchone()
+                if producto:
+                    producto_dict = {
+                        'codigo': producto[0], 'nombre': producto[1], 'precio_compra': producto[2],
+                        'precio_normal': producto[3], 'precio_mayoreo_1': producto[4],
+                        'precio_mayoreo_2': producto[5], 'precio_mayoreo_3': producto[6],
+                        'stock': producto[7], 'tipo_venta': producto[8], 'precio_por_kg': producto[9],
+                        'peso_unitario': producto[10], 'stock_kg': producto[11],
+                        'stock_minimo': producto[12], 'stock_minimo_kg': producto[13],
+                        'stock_maximo': producto[14], 'stock_maximo_kg': producto[15],
+                        'categoria': producto[16]
+                    }
+                    sync.sync_producto_to_supabase(producto_dict)
+        except Exception as sync_error:
+            print(f"Error en sincronización automática: {sync_error}")
+        
         return True
     except Exception as e:
         print(f"Error al actualizar stock: {e}")
@@ -416,11 +461,16 @@ def mostrar_alertas_stock():
             column_config={
                 "codigo": "Código",
                 "nombre": "Producto",
-                "tipo_venta": st.column_config.SelectboxColumn("Tipo", options=["unidad", "granel"]),
-                "stock": st.column_config.NumberColumn("Stock (Unidades)"),
-                "stock_kg": st.column_config.NumberColumn("Stock (Kg)", format="%.2f kg"),
-                "stock_minimo": st.column_config.NumberColumn("Stock Mín (Unidades)"),
-                "stock_minimo_kg": st.column_config.NumberColumn("Stock Mín (Kg)", format="%.2f kg"),
+                "tipo_venta": None,
+                "stock": None,
+                "stock_kg": None,
+                "stock_minimo": None,
+                "stock_minimo_kg": None,
+                "stock_maximo": None,
+                "stock_maximo_kg": None,
+                "stock_display": st.column_config.TextColumn("📦 Stock Actual", width="small"),
+                "stock_minimo_display": st.column_config.TextColumn("⚠️ Stock Mín", width="small"),
+                "stock_maximo_display": st.column_config.TextColumn("🎯 Stock Máx", width="small"),
                 "porcentaje_stock": st.column_config.ProgressColumn(
                     "% Stock",
                     help="Porcentaje del stock actual vs stock máximo (100% = capacidad completa)",
@@ -428,7 +478,11 @@ def mostrar_alertas_stock():
                     max_value=100,
                     format="%d%%"
                 ),
-                "cantidad_necesaria": st.column_config.NumberColumn("Cantidad Necesaria", format="%.2f"),
+                "cantidad_necesaria": st.column_config.NumberColumn(
+                    "🛒 Cantidad a Pedir", 
+                    format="%.2f",
+                    help="Cantidad necesaria para completar al stock máximo (capacidad completa). Fórmula: Stock Máximo - Stock Actual"
+                ),
                 "precio_compra": st.column_config.NumberColumn("Precio Compra", format="$%.2f"),
                 "precio_normal": st.column_config.NumberColumn("Precio Venta", format="$%.2f"),
                 "precio_por_kg": st.column_config.NumberColumn("Precio/Kg", format="$%.2f/kg")
@@ -558,7 +612,9 @@ def mostrar():
     
     with col_header1:
         if es_admin:
-            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin_inventario', 'admin')} | Permisos de configuración activos")
+            # Obtener tiempo restante usando función centralizada
+            horas_restantes, minutos_restantes = obtener_tiempo_restante()
+            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | Sesión: {horas_restantes}h {minutos_restantes}m restantes")
         else:
             st.info("👀 **Modo Solo Lectura** - Inventario en modo consulta. Configuraciones restringidas.")
     
@@ -576,7 +632,7 @@ def mostrar():
     
     # Mostrar formulario de login si se solicita
     if not es_admin and st.session_state.get('mostrar_login_inventario', False):
-        mostrar_formulario_login()
+        mostrar_formulario_login("INVENTARIO")
         st.markdown("---")
         
         # Botón para cancelar login
@@ -613,109 +669,11 @@ def mostrar():
     # Separador
     st.divider()
     
-    # 2. Análisis Visual
-    st.subheader("📊 Análisis Visual")
-    
-    if not productos_df.empty:
-        col_grafico1, col_grafico2 = st.columns(2)
-        
-        with col_grafico1:
-            # Gráfico de stock actual
-            fig_stock = px.bar(
-                productos_df.head(10), 
-                x='nombre', 
-                y='stock', 
-                title='Stock Actual (Top 10 productos)',
-                color='stock',
-                color_continuous_scale='RdYlGn'
-            )
-            fig_stock.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_stock, width='stretch')
-        
-        with col_grafico2:
-            # Gráfico de estado del stock
-            if 'estado_stock' in productos_df.columns:
-                # Calcular estado del stock para el gráfico
-                def calcular_estado_stock(row):
-                    if row.get('tipo_venta', 'unidad') == 'granel':
-                        stock_actual = row.get('stock_kg', 0)
-                        stock_min = row.get('stock_minimo_kg', 0)
-                    else:
-                        stock_actual = row.get('stock', 0)
-                        stock_min = row.get('stock_minimo', 10)
-                    
-                    if stock_min > 0:
-                        if stock_actual <= (stock_min * 0.5):
-                            return '🔴 CRÍTICO'
-                        elif stock_actual <= stock_min:
-                            return '🟡 BAJO'
-                        else:
-                            return '🟢 NORMAL'
-                    return '🟢 NORMAL'
-                
-                productos_df['estado_stock'] = productos_df.apply(calcular_estado_stock, axis=1)
-                estado_counts = productos_df['estado_stock'].value_counts()
-                
-                if not estado_counts.empty:
-                    fig_estados = px.pie(
-                        values=estado_counts.values,
-                        names=estado_counts.index,
-                        title='Distribución del Estado del Stock',
-                        color_discrete_map={
-                            '🔴 CRÍTICO': '#ff4757',
-                            '🟡 BAJO': '#ffa502',
-                            '🟢 NORMAL': '#2ed573'
-                        }
-                    )
-                    st.plotly_chart(fig_estados, width='stretch')
-        
-        # Gráfico adicional: Productos por tipo de venta
-        col_grafico3, col_grafico4 = st.columns(2)
-        
-        with col_grafico3:
-            if 'tipo_venta' in productos_df.columns:
-                tipo_venta_counts = productos_df['tipo_venta'].value_counts()
-                if not tipo_venta_counts.empty:
-                    fig_tipos = px.bar(
-                        x=tipo_venta_counts.index,
-                        y=tipo_venta_counts.values,
-                        title='Productos por Tipo de Venta',
-                        labels={'x': 'Tipo de Venta', 'y': 'Cantidad de Productos'},
-                        color=tipo_venta_counts.values,
-                        color_continuous_scale='viridis'
-                    )
-                    st.plotly_chart(fig_tipos, width='stretch')
-        
-        with col_grafico4:
-            # Gráfico de valor del inventario por producto
-            if 'precio_compra' in productos_df.columns:
-                productos_df['valor_stock'] = productos_df['stock'] * productos_df['precio_compra']
-                top_valor = productos_df.nlargest(10, 'valor_stock')
-                
-                if not top_valor.empty:
-                    fig_valor = px.bar(
-                        top_valor,
-                        x='nombre',
-                        y='valor_stock',
-                        title='Top 10 - Valor del Stock por Producto',
-                        labels={'valor_stock': 'Valor ($)', 'nombre': 'Producto'},
-                        color='valor_stock',
-                        color_continuous_scale='Blues'
-                    )
-                    fig_valor.update_xaxes(tickangle=45)
-                    st.plotly_chart(fig_valor, width='stretch')
-    else:
-        st.info("Agrega productos para ver análisis visual")
-    
-    # Separador
-    st.divider()
-    
-    # 3. Inventario Actual
+    # 2. Inventario Actual
     st.subheader("📋 Inventario Actual")
     
     if not productos_df.empty:
         # Asegurar que las columnas de stock_maximo existan pero NO sobrescribir valores guardados
-        # (No asignamos el stock actual como máximo automáticamente, eso causaba que el % siempre fuera 100%)
         if 'stock_maximo' not in productos_df.columns:
             productos_df['stock_maximo'] = 0
         if 'stock_maximo_kg' not in productos_df.columns:
@@ -734,7 +692,6 @@ def mostrar():
             
             if stock_max > 0:
                 porcentaje = (stock_actual / stock_max) * 100
-                # Calcular porcentaje mínimo
                 porcentaje_min = (stock_min / stock_max) * 100 if stock_min > 0 else 20
                 
                 if porcentaje <= (porcentaje_min * 0.5):
@@ -744,7 +701,6 @@ def mostrar():
                 else:
                     return '🟢 NORMAL'
             
-            # Si no hay stock máximo definido, usar lógica simple
             if stock_actual == 0:
                 return '🔴 CRÍTICO'
             elif stock_min > 0 and stock_actual <= stock_min:
@@ -759,11 +715,9 @@ def mostrar():
                 stock_actual = row.get('stock', 0)
                 stock_max = row.get('stock_maximo', 0)
 
-            # Si hay un stock máximo definido, calcular porcentaje relativo a ese máximo
             if stock_max > 0:
                 return ((stock_actual / stock_max) * 100)
             
-            # Si no hay stock, retornar 0%
             return 0.0
         
         productos_df['estado_stock'] = productos_df.apply(calcular_estado_stock, axis=1)
@@ -838,6 +792,22 @@ def mostrar():
             axis=1
         )
         
+        df_filtrado['stock_maximo_display'] = df_filtrado.apply(
+            lambda row: f"{row['stock_maximo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{row['stock_maximo']} unid.",
+            axis=1
+        )
+        
+        # Crear columnas editables unificadas que muestran el valor correcto según tipo de venta
+        df_filtrado['stock_minimo_editable'] = df_filtrado.apply(
+            lambda row: row['stock_minimo_kg'] if row['tipo_venta'] == 'granel' else float(row['stock_minimo']),
+            axis=1
+        )
+        
+        df_filtrado['stock_maximo_editable'] = df_filtrado.apply(
+            lambda row: row['stock_maximo_kg'] if row['tipo_venta'] == 'granel' else float(row['stock_maximo']),
+            axis=1
+        )
+        
         # Formatear categoría con iconos
         df_filtrado['categoria_display'] = df_filtrado['categoria'].map({
             'cremeria': '🥛 Cremería',
@@ -851,49 +821,323 @@ def mostrar():
             'granel': '⚖️ Granel'
         })
         
-        # Crear DataFrame con el orden solicitado:
-        # Código, Producto, Categoría, Tipo, Precio Venta, Stock, Stock Mín, % Stock, Estado, Mayoreos, Precio Compra
-        df_display = df_filtrado[[
-            'codigo', 'nombre', 'categoria_display', 'tipo_display',
-            'precio_normal', 'stock_display', 'stock_minimo_display',
-            'porcentaje_stock', 'estado_stock',
-            'precio_mayoreo_1', 'precio_mayoreo_2', 'precio_mayoreo_3',
-            'precio_compra'
-        ]].copy()
+        # Tabla unificada con edición para admins o solo lectura para usuarios
+        if es_admin:
+            st.markdown("### ✏️ Editor de Inventario Completo")
+            st.info("💡 **Modo Administrador:** Edita precios y nombres directamente. Los cambios se sincronizan con Supabase automáticamente.")
+            
+            # Preparar DataFrame editable con todas las columnas visibles
+            df_editable = df_filtrado[[
+                'codigo', 'nombre', 'categoria_display', 'tipo_display', 'tipo_venta',
+                'precio_normal', 'precio_compra', 'stock_display',
+                'stock_minimo_editable', 'stock_maximo_editable',
+                'porcentaje_stock', 'estado_stock',
+                'precio_mayoreo_1', 'precio_mayoreo_2', 'precio_mayoreo_3'
+            ]].copy()
+            
+            # Editor de datos con todas las columnas
+            edited_df = st.data_editor(
+                df_editable,
+                column_config={
+                    "codigo": st.column_config.TextColumn("Código", disabled=True, width="small"),
+                    "nombre": st.column_config.TextColumn("📝 Producto", width="medium"),
+                    "categoria_display": st.column_config.TextColumn("🏪 Categoría", disabled=True, width="small"),
+                    "tipo_display": st.column_config.TextColumn("Tipo", disabled=True, width="small"),
+                    "tipo_venta": None,  # Ocultar columna tipo_venta
+                    "precio_normal": st.column_config.NumberColumn("💵 Precio Venta", format="$%.2f", min_value=0.01, width="small"),
+                    "precio_compra": st.column_config.NumberColumn("💰 Precio Compra", format="$%.2f", min_value=0.01, width="small"),
+                    "stock_display": st.column_config.TextColumn("📦 Stock", disabled=True, width="small", help="Stock actual según tipo de venta"),
+                    "stock_minimo_editable": st.column_config.NumberColumn("⚠️ Stock Mín", format="%.2f", min_value=0.0, width="small", help="Stock mínimo (unidades o kg según tipo)"),
+                    "stock_maximo_editable": st.column_config.NumberColumn("🎯 Stock Máx", format="%.2f", min_value=0.0, width="small", help="Stock máximo (unidades o kg según tipo)"),
+                    "porcentaje_stock": st.column_config.ProgressColumn(
+                        "% Stock",
+                        help="Porcentaje del stock actual vs stock máximo (100% = capacidad completa)",
+                        min_value=0,
+                        max_value=100,
+                        format="%.1f%%",
+                        width="small"
+                    ),
+                    "estado_stock": st.column_config.TextColumn("Estado", disabled=True, width="small"),
+                    "precio_mayoreo_1": st.column_config.NumberColumn("💼 Mayoreo 1", format="$%.2f", width="small"),
+                    "precio_mayoreo_2": st.column_config.NumberColumn("💼 Mayoreo 2", format="$%.2f", width="small"),
+                    "precio_mayoreo_3": st.column_config.NumberColumn("💼 Mayoreo 3", format="$%.2f", width="small")
+                },
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                key="editor_inventario_completo"
+            )
+            
+            # Botón para guardar cambios
+            col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+            with col_btn2:
+                if st.button("💾 GUARDAR CAMBIOS", type="primary", use_container_width=True, key="guardar_cambios_inventario"):
+                    cambios_realizados = 0
+                    productos_sincronizados = 0
+                    errores = []
+                    codigos_modificados = []
+                    
+                    # Comparar DataFrames para detectar cambios
+                    for idx in range(len(edited_df)):
+                        codigo = edited_df.iloc[idx]['codigo']
+                        nombre_nuevo = edited_df.iloc[idx]['nombre']
+                        precio_venta_nuevo = edited_df.iloc[idx]['precio_normal']
+                        precio_compra_nuevo = edited_df.iloc[idx]['precio_compra']
+                        precio_mayoreo_1_nuevo = edited_df.iloc[idx]['precio_mayoreo_1']
+                        precio_mayoreo_2_nuevo = edited_df.iloc[idx]['precio_mayoreo_2']
+                        precio_mayoreo_3_nuevo = edited_df.iloc[idx]['precio_mayoreo_3']
+                        
+                        # Buscar valores originales
+                        original = df_editable[df_editable['codigo'] == codigo].iloc[0]
+                        
+                        # Leer valores de stock unificados
+                        stock_minimo_editable_nuevo = edited_df.iloc[idx]['stock_minimo_editable']
+                        stock_maximo_editable_nuevo = edited_df.iloc[idx]['stock_maximo_editable']
+                        tipo_venta = edited_df.iloc[idx]['tipo_venta']
+                        
+                        # Detectar cambios
+                        cambios = []
+                        if nombre_nuevo != original['nombre']:
+                            cambios.append(("nombre", nombre_nuevo))
+                        if precio_venta_nuevo != original['precio_normal']:
+                            cambios.append(("precio_normal", precio_venta_nuevo))
+                        if precio_compra_nuevo != original['precio_compra']:
+                            cambios.append(("precio_compra", precio_compra_nuevo))
+                        if precio_mayoreo_1_nuevo != original['precio_mayoreo_1']:
+                            cambios.append(("precio_mayoreo_1", precio_mayoreo_1_nuevo))
+                        if precio_mayoreo_2_nuevo != original['precio_mayoreo_2']:
+                            cambios.append(("precio_mayoreo_2", precio_mayoreo_2_nuevo))
+                        if precio_mayoreo_3_nuevo != original['precio_mayoreo_3']:
+                            cambios.append(("precio_mayoreo_3", precio_mayoreo_3_nuevo))
+                        
+                        # Detectar cambios en stock mínimo y máximo según tipo de venta
+                        if stock_minimo_editable_nuevo != original['stock_minimo_editable']:
+                            if tipo_venta == 'granel':
+                                cambios.append(("stock_minimo_kg", stock_minimo_editable_nuevo))
+                            else:
+                                cambios.append(("stock_minimo", int(stock_minimo_editable_nuevo)))
+                        
+                        if stock_maximo_editable_nuevo != original['stock_maximo_editable']:
+                            if tipo_venta == 'granel':
+                                cambios.append(("stock_maximo_kg", stock_maximo_editable_nuevo))
+                            else:
+                                cambios.append(("stock_maximo", int(stock_maximo_editable_nuevo)))
+                        
+                        # Aplicar cambios si hay alguno
+                        if cambios:
+                            try:
+                                conn = sqlite3.connect(DB_PATH)
+                                cursor = conn.cursor()
+                                
+                                for campo, valor in cambios:
+                                    cursor.execute(f"UPDATE productos SET {campo} = ? WHERE codigo = ?", (valor, codigo))
+                                
+                                conn.commit()
+                                conn.close()
+                                cambios_realizados += 1
+                                codigos_modificados.append(codigo)
+                            except Exception as e:
+                                errores.append(f"Error en producto {codigo}: {str(e)}")
+                    
+                    # Sincronizar con Supabase después de guardar en SQLite
+                    if cambios_realizados > 0:
+                        if sync.is_online():
+                            with st.spinner('🔄 Sincronizando cambios con Supabase...'):
+                                # Conectar una sola vez para todos los productos
+                                conn_sync = sqlite3.connect(DB_PATH)
+                                conn_sync.row_factory = sqlite3.Row
+                                cursor_sync = conn_sync.cursor()
+                                
+                                for codigo in codigos_modificados:
+                                    try:
+                                        # Obtener TODOS los datos del producto desde SQLite
+                                        cursor_sync.execute("SELECT * FROM productos WHERE codigo = ?", (codigo,))
+                                        producto_row = cursor_sync.fetchone()
+                                        
+                                        if producto_row:
+                                            # Convertir a diccionario con TODOS los campos
+                                            producto_dict = dict(producto_row)
+                                            
+                                            # Sincronizar con Supabase (ahora retorna tupla)
+                                            exito, error_msg = sync.sync_producto_to_supabase(producto_dict)
+                                            
+                                            if exito:
+                                                productos_sincronizados += 1
+                                            else:
+                                                errores.append(f"⚠️ Producto {codigo}: {error_msg}")
+                                        else:
+                                            errores.append(f"⚠️ Producto {codigo} no encontrado en SQLite")
+                                    except Exception as e:
+                                        errores.append(f"⚠️ Error al sincronizar {codigo}: {str(e)}")
+                                
+                                conn_sync.close()
+                        else:
+                            st.warning("⚠️ Sin conexión a internet - Los cambios se sincronizarán cuando haya conexión")
+                    
+                    # Mostrar resultados
+                    if cambios_realizados > 0:
+                        st.success(f"✅ {cambios_realizados} producto(s) actualizado(s) en SQLite")
+                        
+                        if productos_sincronizados > 0:
+                            if productos_sincronizados == cambios_realizados:
+                                st.success(f"☁️ Todos los cambios sincronizados con Supabase ({productos_sincronizados}/{cambios_realizados})")
+                            else:
+                                st.warning(f"⚠️ Sincronizados {productos_sincronizados} de {cambios_realizados} productos con Supabase")
+                        
+                        time.sleep(1.5)
+                        st.rerun()
+                    
+                    if errores:
+                        with st.expander("⚠️ Ver errores de sincronización", expanded=True):
+                            for error in errores:
+                                st.error(error)
+                    
+                    if cambios_realizados == 0 and not errores:
+                        st.info("ℹ️ No se detectaron cambios para guardar")
         
-        # Configuración de columnas
-        column_config = {
-            "codigo": st.column_config.TextColumn("Código", width="small"),
-            "nombre": st.column_config.TextColumn("Producto", width="medium"),
-            "categoria_display": st.column_config.TextColumn("🏪 Categoría", width="small"),
-            "tipo_display": st.column_config.TextColumn("Tipo", width="small"),
-            "precio_normal": st.column_config.NumberColumn("💵 Precio Venta", format="$%.2f", width="small"),
-            "stock_display": st.column_config.TextColumn("📦 Stock", width="small", help="Stock actual según tipo de venta"),
-            "stock_minimo_display": st.column_config.TextColumn("⚠️ Stock Mín", width="small", help="Stock mínimo según tipo de venta"),
-            "porcentaje_stock": st.column_config.ProgressColumn(
-                "% Stock",
-                help="Porcentaje del stock actual vs stock máximo (100% = capacidad completa)",
-                min_value=0,
-                max_value=100,
-                format="%.1f%%",
-                width="small"
-            ),
-            "estado_stock": st.column_config.TextColumn("Estado", width="small"),
-            "precio_mayoreo_1": st.column_config.NumberColumn("💼 Mayoreo 1", format="$%.2f", width="small"),
-            "precio_mayoreo_2": st.column_config.NumberColumn("💼 Mayoreo 2", format="$%.2f", width="small"),
-            "precio_mayoreo_3": st.column_config.NumberColumn("💼 Mayoreo 3", format="$%.2f", width="small"),
-            "precio_compra": st.column_config.NumberColumn("💰 Precio Compra", format="$%.2f", width="small")
-        }
-        
-        # Mostrar tabla ordenada
-        st.dataframe(
-            df_display,
-            column_config=column_config,
-            hide_index=True,
-            width="stretch"
-        )
+        else:
+            # Vista de solo lectura para usuarios no admin
+            st.markdown("### 📊 Vista del Inventario")
+            
+            df_display = df_filtrado[[
+                'codigo', 'nombre', 'categoria_display', 'tipo_display',
+                'precio_normal', 'stock_display', 'stock_minimo_display', 'stock_maximo_display',
+                'porcentaje_stock', 'estado_stock',
+                'precio_mayoreo_1', 'precio_mayoreo_2', 'precio_mayoreo_3',
+                'precio_compra'
+            ]].copy()
+            
+            # Configuración de columnas para vista de solo lectura
+            column_config = {
+                "codigo": st.column_config.TextColumn("Código", width="small"),
+                "nombre": st.column_config.TextColumn("Producto", width="medium"),
+                "categoria_display": st.column_config.TextColumn("🏪 Categoría", width="small"),
+                "tipo_display": st.column_config.TextColumn("Tipo", width="small"),
+                "precio_normal": st.column_config.NumberColumn("💵 Precio Venta", format="$%.2f", width="small"),
+                "stock_display": st.column_config.TextColumn("📦 Stock", width="small", help="Stock actual según tipo de venta"),
+                "stock_minimo_display": st.column_config.TextColumn("⚠️ Stock Mín", width="small", help="Stock mínimo según tipo de venta"),
+                "stock_maximo_display": st.column_config.TextColumn("🎯 Stock Máx", width="small", help="Stock máximo (capacidad) según tipo de venta"),
+                "porcentaje_stock": st.column_config.ProgressColumn(
+                    "% Stock",
+                    help="Porcentaje del stock actual vs stock máximo (100% = capacidad completa)",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                    width="small"
+                ),
+                "estado_stock": st.column_config.TextColumn("Estado", width="small"),
+                "precio_mayoreo_1": st.column_config.NumberColumn("💼 Mayoreo 1", format="$%.2f", width="small"),
+                "precio_mayoreo_2": st.column_config.NumberColumn("💼 Mayoreo 2", format="$%.2f", width="small"),
+                "precio_mayoreo_3": st.column_config.NumberColumn("💼 Mayoreo 3", format="$%.2f", width="small"),
+                "precio_compra": st.column_config.NumberColumn("💰 Precio Compra", format="$%.2f", width="small")
+            }
+            
+            # Mostrar tabla de solo lectura
+            st.dataframe(
+                df_display,
+                column_config=column_config,
+                hide_index=True,
+                use_container_width=True
+            )
     else:
         st.info("No hay productos en el inventario")
+    
+    # Separador
+    st.divider()
+    
+    # 3. Análisis Visual
+    st.subheader("📊 Análisis Visual")
+    
+    if not productos_df.empty:
+        col_grafico1, col_grafico2 = st.columns(2)
+        
+        with col_grafico1:
+            # Gráfico de stock actual
+            fig_stock = px.bar(
+                productos_df.head(10), 
+                x='nombre', 
+                y='stock', 
+                title='Stock Actual (Top 10 productos)',
+                color='stock',
+                color_continuous_scale='RdYlGn'
+            )
+            fig_stock.update_xaxes(tickangle=45)
+            st.plotly_chart(fig_stock, use_container_width=True)
+        
+        with col_grafico2:
+            # Gráfico de estado del stock
+            if 'estado_stock' in productos_df.columns:
+                # Calcular estado del stock para el gráfico
+                def calcular_estado_stock(row):
+                    if row.get('tipo_venta', 'unidad') == 'granel':
+                        stock_actual = row.get('stock_kg', 0)
+                        stock_min = row.get('stock_minimo_kg', 0)
+                    else:
+                        stock_actual = row.get('stock', 0)
+                        stock_min = row.get('stock_minimo', 10)
+                    
+                    if stock_min > 0:
+                        if stock_actual <= (stock_min * 0.5):
+                            return '🔴 CRÍTICO'
+                        elif stock_actual <= stock_min:
+                            return '🟡 BAJO'
+                        else:
+                            return '🟢 NORMAL'
+                    return '🟢 NORMAL'
+                
+                productos_df['estado_stock'] = productos_df.apply(calcular_estado_stock, axis=1)
+                estado_counts = productos_df['estado_stock'].value_counts()
+                
+                if not estado_counts.empty:
+                    fig_estados = px.pie(
+                        values=estado_counts.values,
+                        names=estado_counts.index,
+                        title='Distribución del Estado del Stock',
+                        color_discrete_map={
+                            '🔴 CRÍTICO': '#ff4757',
+                            '🟡 BAJO': '#ffa502',
+                            '🟢 NORMAL': '#2ed573'
+                        }
+                    )
+                    st.plotly_chart(fig_estados, use_container_width=True)
+        
+        # Gráfico adicional: Productos por tipo de venta
+        col_grafico3, col_grafico4 = st.columns(2)
+        
+        with col_grafico3:
+            if 'tipo_venta' in productos_df.columns:
+                tipo_venta_counts = productos_df['tipo_venta'].value_counts()
+                if not tipo_venta_counts.empty:
+                    fig_tipos = px.bar(
+                        x=tipo_venta_counts.index,
+                        y=tipo_venta_counts.values,
+                        title='Productos por Tipo de Venta',
+                        labels={'x': 'Tipo de Venta', 'y': 'Cantidad de Productos'},
+                        color=tipo_venta_counts.values,
+                        color_continuous_scale='viridis'
+                    )
+                    st.plotly_chart(fig_tipos, use_container_width=True)
+        
+        with col_grafico4:
+            # Gráfico de valor del inventario por producto
+            if 'precio_compra' in productos_df.columns:
+                productos_df['valor_stock'] = productos_df['stock'] * productos_df['precio_compra']
+                top_valor = productos_df.nlargest(10, 'valor_stock')
+                
+                if not top_valor.empty:
+                    fig_valor = px.bar(
+                        top_valor,
+                        x='nombre',
+                        y='valor_stock',
+                        title='Top 10 - Valor del Stock por Producto',
+                        labels={'valor_stock': 'Valor ($)', 'nombre': 'Producto'},
+                        color='valor_stock',
+                        color_continuous_scale='Blues'
+                    )
+                    fig_valor.update_xaxes(tickangle=45)
+                    st.plotly_chart(fig_valor, use_container_width=True)
+    else:
+        st.info("Agrega productos para ver análisis visual")
     
     # Separador
     st.divider()
