@@ -3,6 +3,11 @@ import sqlite3
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, date
+import time
+from sync_manager import get_sync_manager
+
+# Inicializar gestor de sincronización
+sync = get_sync_manager()
 
 # Ruta de la base de datos
 DB_PATH = "pos_cremeria.db"
@@ -51,6 +56,14 @@ def mostrar():
     
     # Crear tablas si no existen
     crear_tablas_finanzas()
+    
+    # Sincronizar datos desde Supabase al inicio (solo si hay conexión)
+    if sync.is_online():
+        with st.spinner('🔄 Sincronizando datos desde Supabase...'):
+            resultado_ordenes = sync.sync_ordenes_compra_from_supabase()
+            
+            if resultado_ordenes.get('success', 0) > 0:
+                st.toast(f"✅ {resultado_ordenes['success']} órdenes de compra sincronizadas")
 
     # CSS personalizado para agrandar tabs con fondo negro y letras blancas/negras
     st.markdown("""
@@ -244,6 +257,10 @@ def mostrar_resumen_financiero_completo():
         result_ventas = conn.execute(ventas_query, (fecha_desde_str, fecha_hasta_str)).fetchone()
         ingresos_ventas = float(result_ventas[0]) if result_ventas[0] else 0.0
         
+        # Debug: mostrar cuántas ventas se encontraron
+        debug_query = f"SELECT COUNT(*) as cantidad FROM ventas WHERE DATE(fecha) BETWEEN '{fecha_desde_str}' AND '{fecha_hasta_str}'"
+        debug_result = conn.execute(debug_query).fetchone()
+        
         # Ingresos pasivos
         ingresos_pasivos_query = """
             SELECT SUM(monto) as total_pasivos
@@ -277,6 +294,27 @@ def mostrar_resumen_financiero_completo():
     
     with col_ing3:
         st.metric("💚 **TOTAL INGRESOS**", f"${total_ingresos:,.2f}")
+    
+    # Debug info
+    with st.expander("🔍 Información de Debug"):
+        st.write(f"**Período consultado:** {fecha_desde_str} a {fecha_hasta_str}")
+        st.write(f"**Ventas encontradas:** {debug_result[0]} registros")
+        st.write(f"**Total de ventas:** ${ingresos_ventas:,.2f}")
+        
+        # Mostrar todas las ventas del período para verificar
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            ventas_debug = pd.read_sql_query(
+                f"SELECT fecha, codigo, nombre, total FROM ventas WHERE DATE(fecha) BETWEEN '{fecha_desde_str}' AND '{fecha_hasta_str}' ORDER BY fecha DESC",
+                conn
+            )
+            if not ventas_debug.empty:
+                st.write(f"**Listado de {len(ventas_debug)} ventas:**")
+                st.dataframe(ventas_debug, use_container_width=True)
+            else:
+                st.warning("No se encontraron ventas en el período seleccionado")
+        finally:
+            conn.close()
     
     st.divider()
     
@@ -405,6 +443,17 @@ def mostrar_resumen_financiero_completo():
 def mostrar_registro_egresos():
     st.subheader("📉 Registrar Egresos")
     
+    # Sub-tabs para egresos manuales y órdenes de compra
+    subtab_egr1, subtab_egr2 = st.tabs(["💸 Egresos Manuales", "🧾 Órdenes de Compra"])
+    
+    with subtab_egr1:
+        mostrar_egresos_manuales()
+    
+    with subtab_egr2:
+        mostrar_ordenes_compra()
+
+def mostrar_egresos_manuales():
+    """Formulario para registrar egresos manuales"""
     col_egr1, col_egr2 = st.columns([2, 1])
     
     with col_egr1:
@@ -460,7 +509,28 @@ def mostrar_registro_egresos():
                         VALUES (?, ?, ?, ?, ?)
                     ''', (fecha_egreso_str, tipo_egreso, descripcion_egreso, monto_egreso, observaciones_egreso))
                     
+                    egreso_id = cursor.lastrowid
                     conn.commit()
+                    
+                    # Sincronizar a Supabase automáticamente
+                    if sync.is_online():
+                        try:
+                            cursor.execute("SELECT * FROM egresos_adicionales WHERE id = ?", (egreso_id,))
+                            egreso = cursor.fetchone()
+                            if egreso:
+                                egreso_dict = {
+                                    'id': egreso[0],
+                                    'fecha': egreso[1],
+                                    'tipo': egreso[2],
+                                    'descripcion': egreso[3],
+                                    'monto': egreso[4],
+                                    'observaciones': egreso[5],
+                                    'usuario': egreso[6] if len(egreso) > 6 else 'Sistema'
+                                }
+                                sync.sync_egreso_to_supabase(egreso_dict)
+                        except Exception as sync_error:
+                            print(f"Error en sincronización: {sync_error}")
+                    
                     st.success(f"✅ Egreso registrado: {tipo_egreso} - ${monto_egreso:.2f}")
                     st.rerun()
                     
@@ -545,6 +615,266 @@ def mostrar_registro_egresos():
     else:
         st.info("No hay egresos registrados")
 
+def mostrar_ordenes_compra():
+    """Mostrar órdenes de compra pendientes de pago"""
+    st.write("### 🧾 Órdenes de Compra")
+    
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        # Obtener órdenes de compra con información de pedidos
+        ordenes_query = """
+            SELECT 
+                oc.id, 
+                oc.fecha_creacion, 
+                oc.total_orden, 
+                oc.estado, 
+                oc.fecha_pago, 
+                oc.notas,
+                oc.pedido_id,
+                p.fecha_pedido,
+                p.fecha_entrega_esperada
+            FROM ordenes_compra oc
+            LEFT JOIN pedidos p ON oc.pedido_id = p.id
+            ORDER BY 
+                CASE WHEN oc.estado = 'PENDIENTE' THEN 0 ELSE 1 END,
+                oc.fecha_creacion DESC
+        """
+        ordenes_df = pd.read_sql_query(ordenes_query, conn)
+    finally:
+        conn.close()
+    
+    if ordenes_df.empty:
+        st.info("📋 No hay órdenes de compra registradas")
+        return
+    
+    # Filtros
+    col_filtro1, col_filtro2 = st.columns(2)
+    
+    with col_filtro1:
+        mostrar_pagadas = st.checkbox("Mostrar órdenes pagadas", value=False, key="mostrar_ordenes_pagadas")
+    
+    with col_filtro2:
+        if not mostrar_pagadas:
+            ordenes_pendientes = len(ordenes_df[ordenes_df['estado'] == 'PENDIENTE'])
+            st.metric("⏳ Órdenes Pendientes", ordenes_pendientes)
+    
+    # Filtrar por estado
+    if not mostrar_pagadas:
+        ordenes_df = ordenes_df[ordenes_df['estado'] == 'PENDIENTE']
+    
+    # Mostrar órdenes
+    for _, orden in ordenes_df.iterrows():
+        with st.expander(
+            f"{'🟡' if orden['estado'] == 'PENDIENTE' else '✅'} Orden #{orden['id']} - ${orden['total_orden']:.2f} - {orden['estado']}",
+            expanded=(orden['estado'] == 'PENDIENTE')
+        ):
+            col_orden1, col_orden2 = st.columns([2, 1])
+            
+            with col_orden1:
+                st.write(f"**📅 Fecha creación:** {pd.to_datetime(orden['fecha_creacion']).strftime('%d/%m/%Y %H:%M')}")
+                
+                if orden['fecha_pedido']:
+                    st.write(f"**📝 Fecha del pedido:** {orden['fecha_pedido']}")
+                
+                if orden['fecha_entrega_esperada']:
+                    st.write(f"**🚚 Entrega esperada:** {orden['fecha_entrega_esperada']}")
+                
+                st.write(f"**💰 Total orden:** ${orden['total_orden']:.2f}")
+                st.write(f"**📊 Estado:** {orden['estado']}")
+                
+                if orden['fecha_pago']:
+                    st.write(f"**✅ Fecha pago:** {orden['fecha_pago']}")
+                
+                st.divider()
+                
+                # Obtener productos de esta orden usando pedido_id
+                productos_orden = pd.DataFrame()
+                if orden['pedido_id']:
+                    conn = sqlite3.connect(DB_PATH)
+                    try:
+                        productos_query = """
+                            SELECT 
+                                nombre_producto, 
+                                cantidad_solicitada as cantidad, 
+                                precio_unitario, 
+                                subtotal,
+                                proveedor
+                            FROM pedidos_items
+                            WHERE pedido_id = ?
+                            ORDER BY nombre_producto
+                        """
+                        productos_orden = pd.read_sql_query(productos_query, conn, params=[orden['pedido_id']])
+                    except Exception as e:
+                        st.error(f"Error al obtener productos: {str(e)}")
+                    finally:
+                        conn.close()
+                
+                if not productos_orden.empty:
+                    st.write("**📦 Productos en esta orden:**")
+                    
+                    # Mostrar tabla detallada
+                    df_display = productos_orden.copy()
+                    st.dataframe(
+                        df_display,
+                        column_config={
+                            "nombre_producto": "🛍️ Producto",
+                            "cantidad": st.column_config.NumberColumn("📊 Cantidad", format="%.2f"),
+                            "precio_unitario": st.column_config.NumberColumn("💲 Precio Unit.", format="$%.2f"),
+                            "subtotal": st.column_config.NumberColumn("💰 Subtotal", format="$%.2f"),
+                            "proveedor": "🏪 Proveedor"
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                        height=200
+                    )
+                    
+                    # Resumen de productos
+                    total_productos = len(productos_orden)
+                    cantidad_total = productos_orden['cantidad'].sum()
+                    st.markdown(f"""
+                    ---
+                    **📦 Resumen:**
+                    - **Número de productos:** {total_productos}
+                    - **Cantidad total:** {cantidad_total:.2f}
+                    - **Costo total:** ${orden['total_orden']:.2f}
+                    """)
+                elif orden['pedido_id']:
+                    st.warning("⚠️ No se encontraron productos para esta orden")
+            
+            with col_orden2:
+                if orden['estado'] == 'PENDIENTE':
+                    st.write("**⚙️ Acciones:**")
+                    
+                    # Botón para marcar como pagada
+                    if st.button(f"✅ Marcar como Pagada", key=f"pagar_orden_{orden['id']}", type="primary", use_container_width=True):
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        
+                        try:
+                            fecha_pago = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # Obtener número de productos para la observación
+                            num_productos = len(productos_orden) if not productos_orden.empty else 0
+                            
+                            # Actualizar orden de compra
+                            cursor.execute("""
+                                UPDATE ordenes_compra 
+                                SET estado = 'PAGADA', fecha_pago = ?
+                                WHERE id = ?
+                            """, (fecha_pago, orden['id']))
+                            
+                            # Registrar en egresos adicionales
+                            cursor.execute("""
+                                INSERT INTO egresos_adicionales (fecha, tipo, descripcion, monto, observaciones)
+                                VALUES (?, 'Compra de Mercancía', ?, ?, ?)
+                            """, (
+                                fecha_pago,
+                                f"Orden de Compra #{orden['id']}",
+                                orden['total_orden'],
+                                f"Pago de orden de compra con {num_productos} productos"
+                            ))
+                            
+                            egreso_id = cursor.lastrowid
+                            
+                            # Marcar el pedido asociado como COMPLETADO
+                            cursor.execute("""
+                                UPDATE pedidos 
+                                SET estado = 'COMPLETADO'
+                                WHERE orden_compra_id = ?
+                            """, (orden['id'],))
+                            
+                            conn.commit()
+                            
+                            # Sincronizar con Supabase
+                            if sync.is_online():
+                                # Sincronizar la orden actualizada
+                                conn_temp = sqlite3.connect(DB_PATH)
+                                conn_temp.row_factory = sqlite3.Row
+                                cursor_temp = conn_temp.cursor()
+                                cursor_temp.execute("SELECT * FROM ordenes_compra WHERE id = ?", (orden['id'],))
+                                orden_actualizada = cursor_temp.fetchone()
+                                conn_temp.close()
+                                
+                                if orden_actualizada:
+                                    exito, error = sync.sync_orden_compra_to_supabase(dict(orden_actualizada))
+                                    if exito:
+                                        st.toast("☁️ Orden sincronizada con Supabase")
+                                
+                                # Sincronizar el pedido asociado (ahora COMPLETADO)
+                                cursor_temp = conn_temp.cursor()
+                                cursor_temp.execute("SELECT * FROM pedidos WHERE orden_compra_id = ?", (orden['id'],))
+                                pedido_actualizado = cursor_temp.fetchone()
+                                if pedido_actualizado:
+                                    sync.sync_pedido_to_supabase(dict(pedido_actualizado))
+                                
+                                # Sincronizar el egreso creado
+                                cursor.execute("SELECT * FROM egresos_adicionales WHERE id = ?", (egreso_id,))
+                                egreso = cursor.fetchone()
+                                if egreso:
+                                    egreso_dict = {
+                                        'id': egreso[0], 'fecha': egreso[1], 'tipo': egreso[2],
+                                        'descripcion': egreso[3], 'monto': egreso[4],
+                                        'observaciones': egreso[5], 'usuario': egreso[6] if len(egreso) > 6 else 'Sistema'
+                                    }
+                                    sync.sync_egreso_to_supabase(egreso_dict)
+                            
+                            st.success(f"✅ Orden #{orden['id']} marcada como pagada, registrada en egresos y pedido completado")
+                            st.balloons()
+                            time.sleep(1)
+                            st.rerun()
+                            
+                        except Exception as e:
+                            conn.rollback()
+                            st.error(f"❌ Error: {str(e)}")
+                        finally:
+                            conn.close()
+                    
+                    # Campo para notas
+                    notas_orden = st.text_area(
+                        "📝 Notas:",
+                        value=orden['notas'] if orden['notas'] else "",
+                        key=f"notas_orden_{orden['id']}",
+                        height=80
+                    )
+                    
+                    if st.button(f"💾 Guardar Notas", key=f"guardar_notas_{orden['id']}", use_container_width=True):
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        
+                        try:
+                            cursor.execute("""
+                                UPDATE ordenes_compra 
+                                SET notas = ?
+                                WHERE id = ?
+                            """, (notas_orden, orden['id']))
+                            
+                            conn.commit()
+                            
+                            # Sincronizar con Supabase
+                            if sync.is_online():
+                                conn_temp = sqlite3.connect(DB_PATH)
+                                conn_temp.row_factory = sqlite3.Row
+                                cursor_temp = conn_temp.cursor()
+                                cursor_temp.execute("SELECT * FROM ordenes_compra WHERE id = ?", (orden['id'],))
+                                orden_actualizada = cursor_temp.fetchone()
+                                conn_temp.close()
+                                
+                                if orden_actualizada:
+                                    exito, error = sync.sync_orden_compra_to_supabase(dict(orden_actualizada))
+                                    if exito:
+                                        st.toast("☁️ Notas sincronizadas con Supabase")
+                            
+                            st.success("✅ Notas guardadas")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error: {str(e)}")
+                        finally:
+                            conn.close()
+                else:
+                    st.success("✅ Orden pagada")
+                    if orden['notas']:
+                        st.info(f"📝 Notas: {orden['notas']}")
+
 def mostrar_registro_ingresos():
     st.subheader("📈 Registrar Ingresos Pasivos")
     
@@ -597,7 +927,27 @@ def mostrar_registro_ingresos():
                         VALUES (?, ?, ?, ?)
                     ''', (fecha_ingreso_str, descripcion_ingreso, monto_ingreso, observaciones_ingreso))
                     
+                    ingreso_id = cursor.lastrowid
                     conn.commit()
+                    
+                    # Sincronizar a Supabase automáticamente
+                    if sync.is_online():
+                        try:
+                            cursor.execute("SELECT * FROM ingresos_pasivos WHERE id = ?", (ingreso_id,))
+                            ingreso = cursor.fetchone()
+                            if ingreso:
+                                ingreso_dict = {
+                                    'id': ingreso[0],
+                                    'fecha': ingreso[1],
+                                    'descripcion': ingreso[2],
+                                    'monto': ingreso[3],
+                                    'observaciones': ingreso[4],
+                                    'usuario': ingreso[5] if len(ingreso) > 5 else 'Sistema'
+                                }
+                                sync.sync_ingreso_to_supabase(ingreso_dict)
+                        except Exception as sync_error:
+                            print(f"Error en sincronización: {sync_error}")
+                    
                     st.success(f"✅ Ingreso registrado: {descripcion_ingreso} - ${monto_ingreso:.2f}")
                     st.rerun()
                     

@@ -264,6 +264,609 @@ class SyncManager:
             return self.sync_producto_to_supabase(dict(producto))
         
         return False
+    
+    # ===== SINCRONIZACIÓN ORDENES DE COMPRA =====
+    
+    def sync_orden_compra_to_supabase(self, orden_data: Dict) -> tuple[bool, str]:
+        """Sincronizar una orden de compra a Supabase"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            # Insertar o actualizar en Supabase
+            result = self.supabase_db.client.table('ordenes_compra').upsert(orden_data, on_conflict='id').execute()
+            
+            if result.data:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar orden de compra a Supabase: {error_msg}")
+            return False, error_msg
+    
+    def sync_all_ordenes_compra_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todas las órdenes de compra a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión a internet'}
+        
+        conn = sqlite3.connect(self.sqlite_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM ordenes_compra")
+        ordenes = cursor.fetchall()
+        conn.close()
+        
+        success = 0
+        failed = 0
+        
+        for orden in ordenes:
+            orden_dict = dict(orden)
+            exito, _ = self.sync_orden_compra_to_supabase(orden_dict)
+            if exito:
+                success += 1
+            else:
+                failed += 1
+        
+        return {'success': success, 'failed': failed}
+    
+    def sync_ordenes_compra_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar órdenes de compra desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión a internet'}
+        
+        try:
+            # Obtener datos de Supabase
+            result = self.supabase_db.client.table('ordenes_compra').select('*').execute()
+            ordenes_supabase = result.data if result.data else []
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for orden in ordenes_supabase:
+                try:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO ordenes_compra 
+                        (id, fecha_creacion, total_orden, estado, fecha_pago, notas, creado_por)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        orden['id'],
+                        orden.get('fecha_creacion'),
+                        orden.get('total_orden', 0),
+                        orden.get('estado', 'PENDIENTE'),
+                        orden.get('fecha_pago'),
+                        orden.get('notas'),
+                        orden.get('creado_por', 'admin')
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al sincronizar orden {orden['id']}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar órdenes desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    # ===== SINCRONIZACIÓN PEDIDOS REABASTECIMIENTO =====
+    
+    def sync_pedido_to_supabase(self, pedido_data: Dict) -> tuple[bool, str]:
+        """Sincronizar un pedido de reabastecimiento a Supabase"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            # Insertar o actualizar en Supabase
+            result = self.supabase_db.client.table('pedidos_reabastecimiento').upsert(pedido_data, on_conflict='id').execute()
+            
+            if result.data:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar pedido a Supabase: {error_msg}")
+            return False, error_msg
+    
+    def sync_all_pedidos_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todos los pedidos de reabastecimiento a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión a internet'}
+        
+        conn = sqlite3.connect(self.sqlite_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM pedidos_reabastecimiento")
+        pedidos = cursor.fetchall()
+        conn.close()
+        
+        success = 0
+        failed = 0
+        
+        for pedido in pedidos:
+            pedido_dict = dict(pedido)
+            exito, _ = self.sync_pedido_to_supabase(pedido_dict)
+            if exito:
+                success += 1
+            else:
+                failed += 1
+        
+        return {'success': success, 'failed': failed}
+    
+    def sync_pedidos_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar pedidos de reabastecimiento desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión a internet'}
+        
+        try:
+            # Obtener datos de Supabase
+            result = self.supabase_db.client.table('pedidos_reabastecimiento').select('*').execute()
+            pedidos_supabase = result.data if result.data else []
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for pedido in pedidos_supabase:
+                try:
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO pedidos_reabastecimiento 
+                        (id, codigo_producto, nombre_producto, stock_actual, stock_minimo, 
+                         cantidad_sugerida, cantidad_ordenada, cantidad_recibida, 
+                         precio_unitario, costo_total, proveedor, fecha_pedido, 
+                         fecha_recepcion, estado, observaciones, orden_compra_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        pedido['id'],
+                        pedido.get('codigo_producto'),
+                        pedido.get('nombre_producto'),
+                        pedido.get('stock_actual', 0),
+                        pedido.get('stock_minimo', 0),
+                        pedido.get('cantidad_sugerida', 0),
+                        pedido.get('cantidad_ordenada', 0),
+                        pedido.get('cantidad_recibida', 0),
+                        pedido.get('precio_unitario', 0),
+                        pedido.get('costo_total', 0),
+                        pedido.get('proveedor'),
+                        pedido.get('fecha_pedido'),
+                        pedido.get('fecha_recepcion'),
+                        pedido.get('estado', 'PENDIENTE'),
+                        pedido.get('observaciones'),
+                        pedido.get('orden_compra_id')
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al sincronizar pedido {pedido['id']}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar pedidos desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    # ===== SINCRONIZACIÓN VENTAS =====
+    
+    def sync_venta_to_supabase(self, venta_data: Dict) -> tuple[bool, str]:
+        """Sincronizar una venta a Supabase"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            # Insertar o actualizar en Supabase
+            result = self.supabase_db.client.table('ventas').upsert(venta_data, on_conflict='id').execute()
+            
+            if result.data:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar venta a Supabase: {error_msg}")
+            return False, error_msg
+    
+    def sync_all_ventas_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todas las ventas de SQLite a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            conn = sqlite3.connect(self.sqlite_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM ventas")
+            ventas = cursor.fetchall()
+            conn.close()
+            
+            success = 0
+            failed = 0
+            
+            for venta in ventas:
+                venta_dict = dict(venta)
+                resultado, _ = self.sync_venta_to_supabase(venta_dict)
+                if resultado:
+                    success += 1
+                else:
+                    failed += 1
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar ventas a Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    def sync_ventas_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar ventas desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            # Obtener todas las ventas de Supabase
+            response = self.supabase_db.client.table('ventas').select('*').execute()
+            ventas = response.data
+            
+            if not ventas:
+                return {'success': 0, 'failed': 0, 'message': 'No hay ventas en Supabase'}
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for venta in ventas:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO ventas 
+                        (id, fecha, codigo, nombre, cantidad, precio_unitario, total, tipo_cliente, tipos_pago,
+                         monto_efectivo, monto_tarjeta, monto_transferencia, monto_credito,
+                         fecha_vencimiento_credito, hora_vencimiento_credito, cliente_credito, pagado, 
+                         alerta_mostrada, peso_vendido, tipo_venta)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        venta.get('id'),
+                        venta.get('fecha'),
+                        venta.get('codigo'),
+                        venta.get('nombre'),
+                        venta.get('cantidad'),
+                        venta.get('precio_unitario'),
+                        venta.get('total'),
+                        venta.get('tipo_cliente'),
+                        venta.get('tipos_pago'),
+                        venta.get('monto_efectivo', 0),
+                        venta.get('monto_tarjeta', 0),
+                        venta.get('monto_transferencia', 0),
+                        venta.get('monto_credito', 0),
+                        venta.get('fecha_vencimiento_credito'),
+                        venta.get('hora_vencimiento_credito', '15:00'),
+                        venta.get('cliente_credito', ''),
+                        venta.get('pagado', 1),
+                        venta.get('alerta_mostrada', 0),
+                        venta.get('peso_vendido', 0),
+                        venta.get('tipo_venta', 'unidad')
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al insertar venta {venta.get('id')}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar ventas desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    # ===== SINCRONIZACIÓN EGRESOS ADICIONALES =====
+    
+    def sync_egreso_to_supabase(self, egreso_data: Dict) -> tuple[bool, str]:
+        """Sincronizar un egreso adicional a Supabase"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            result = self.supabase_db.client.table('egresos_adicionales').upsert(egreso_data, on_conflict='id').execute()
+            
+            if result.data:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar egreso a Supabase: {error_msg}")
+            return False, error_msg
+    
+    def sync_all_egresos_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todos los egresos de SQLite a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            conn = sqlite3.connect(self.sqlite_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM egresos_adicionales")
+            egresos = cursor.fetchall()
+            conn.close()
+            
+            success = 0
+            failed = 0
+            
+            for egreso in egresos:
+                egreso_dict = dict(egreso)
+                resultado, _ = self.sync_egreso_to_supabase(egreso_dict)
+                if resultado:
+                    success += 1
+                else:
+                    failed += 1
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar egresos a Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    def sync_egresos_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar egresos desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            response = self.supabase_db.client.table('egresos_adicionales').select('*').execute()
+            egresos = response.data
+            
+            if not egresos:
+                return {'success': 0, 'failed': 0, 'message': 'No hay egresos en Supabase'}
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for egreso in egresos:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO egresos_adicionales 
+                        (id, fecha, tipo, descripcion, monto, observaciones, usuario)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        egreso.get('id'),
+                        egreso.get('fecha'),
+                        egreso.get('tipo'),
+                        egreso.get('descripcion'),
+                        egreso.get('monto'),
+                        egreso.get('observaciones'),
+                        egreso.get('usuario', 'Sistema')
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al insertar egreso {egreso.get('id')}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar egresos desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    # ===== SINCRONIZACIÓN INGRESOS PASIVOS =====
+    
+    def sync_ingreso_to_supabase(self, ingreso_data: Dict) -> tuple[bool, str]:
+        """Sincronizar un ingreso pasivo a Supabase"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            result = self.supabase_db.client.table('ingresos_pasivos').upsert(ingreso_data, on_conflict='id').execute()
+            
+            if result.data:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar ingreso a Supabase: {error_msg}")
+            return False, error_msg
+    
+    def sync_all_ingresos_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todos los ingresos de SQLite a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            conn = sqlite3.connect(self.sqlite_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM ingresos_pasivos")
+            ingresos = cursor.fetchall()
+            conn.close()
+            
+            success = 0
+            failed = 0
+            
+            for ingreso in ingresos:
+                ingreso_dict = dict(ingreso)
+                resultado, _ = self.sync_ingreso_to_supabase(ingreso_dict)
+                if resultado:
+                    success += 1
+                else:
+                    failed += 1
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar ingresos a Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    def sync_ingresos_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar ingresos desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            response = self.supabase_db.client.table('ingresos_pasivos').select('*').execute()
+            ingresos = response.data
+            
+            if not ingresos:
+                return {'success': 0, 'failed': 0, 'message': 'No hay ingresos en Supabase'}
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for ingreso in ingresos:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO ingresos_pasivos 
+                        (id, fecha, descripcion, monto, observaciones, usuario)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (
+                        ingreso.get('id'),
+                        ingreso.get('fecha'),
+                        ingreso.get('descripcion'),
+                        ingreso.get('monto'),
+                        ingreso.get('observaciones'),
+                        ingreso.get('usuario', 'Sistema')
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al insertar ingreso {ingreso.get('id')}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar ingresos desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    # ===== SINCRONIZACIÓN CRÉDITOS PENDIENTES =====
+    
+    def sync_credito_to_supabase(self, credito_data: Dict) -> tuple[bool, str]:
+        """Sincronizar un crédito pendiente a Supabase"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            result = self.supabase_db.client.table('creditos_pendientes').upsert(credito_data, on_conflict='id').execute()
+            
+            if result.data:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar crédito a Supabase: {error_msg}")
+            return False, error_msg
+    
+    def sync_all_creditos_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todos los créditos de SQLite a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            conn = sqlite3.connect(self.sqlite_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM creditos_pendientes")
+            creditos = cursor.fetchall()
+            conn.close()
+            
+            success = 0
+            failed = 0
+            
+            for credito in creditos:
+                credito_dict = dict(credito)
+                resultado, _ = self.sync_credito_to_supabase(credito_dict)
+                if resultado:
+                    success += 1
+                else:
+                    failed += 1
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar créditos a Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    def sync_creditos_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar créditos desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            response = self.supabase_db.client.table('creditos_pendientes').select('*').execute()
+            creditos = response.data
+            
+            if not creditos:
+                return {'success': 0, 'failed': 0, 'message': 'No hay créditos en Supabase'}
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for credito in creditos:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO creditos_pendientes 
+                        (id, venta_id, cliente, monto, fecha_credito, fecha_vencimiento, hora_vencimiento, estado, alerta_mostrada)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        credito.get('id'),
+                        credito.get('venta_id'),
+                        credito.get('cliente'),
+                        credito.get('monto'),
+                        credito.get('fecha_credito'),
+                        credito.get('fecha_vencimiento'),
+                        credito.get('hora_vencimiento', '15:00'),
+                        credito.get('estado', 'pendiente'),
+                        credito.get('alerta_mostrada', 0)
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al insertar crédito {credito.get('id')}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar créditos desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
 
 # Instancia global del gestor de sincronización
 _sync_manager = None
