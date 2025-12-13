@@ -4,6 +4,14 @@ import pandas as pd
 import plotly.express as px
 from datetime import datetime, date
 import time
+import os
+from supabase import create_client
+try:
+    # Carga automática de variables desde .env si existe
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 from sync_manager import get_sync_manager
 
 # Inicializar gestor de sincronización
@@ -11,6 +19,99 @@ sync = get_sync_manager()
 
 # Ruta de la base de datos
 DB_PATH = "pos_cremeria.db"
+
+# =====================
+# CAJA CHICA - MODELO
+# =====================
+
+def crear_tabla_caja_chica():
+    """Crea tabla de movimientos de caja chica y agrega columna 'fuente' a egresos/ingresos"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS caja_chica_movimientos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                tipo TEXT NOT NULL,              -- 'INGRESO' | 'EGRESO' | 'AJUSTE'
+                monto REAL NOT NULL,
+                descripcion TEXT,
+                usuario TEXT DEFAULT 'Sistema',
+                referencia_tipo TEXT,            -- 'Egreso','Ingreso','Devolucion','OrdenCompra', etc.
+                referencia_id INTEGER
+            )
+            """
+        )
+
+        # Agregar columna 'fuente' a tablas de finanzas si no existe
+        for tabla in ("egresos_adicionales", "ingresos_pasivos"):
+            cursor.execute(f"PRAGMA table_info({tabla})")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'fuente' not in cols:
+                cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN fuente TEXT DEFAULT 'Banco'")
+        conn.commit()
+    except Exception as e:
+        print(f"Error creando estructura de caja chica: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+def saldo_caja_chica():
+    """Devuelve el saldo actual de caja chica (ingresos+ajustes - egresos)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(CASE WHEN tipo IN ('INGRESO','AJUSTE') THEN monto ELSE -monto END), 0)
+            FROM caja_chica_movimientos
+            """
+        )
+        val = cur.fetchone()[0] or 0.0
+        return float(val)
+    finally:
+        conn.close()
+
+def registrar_mov_caja_chica(tipo: str, monto: float, descripcion: str = "", usuario: str = "Sistema",
+                              referencia_tipo: str | None = None, referencia_id: int | None = None):
+    """Inserta un movimiento en caja chica."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO caja_chica_movimientos (tipo, monto, descripcion, usuario, referencia_tipo, referencia_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (tipo, float(monto), descripcion, usuario, referencia_tipo, referencia_id)
+        )
+        conn.commit()
+        mov_id = cur.lastrowid
+        
+        # Sincronizar a Supabase
+        if sync.is_online():
+            try:
+                movimiento_dict = {
+                    'id': mov_id,
+                    'tipo': tipo,
+                    'monto': float(monto),
+                    'descripcion': descripcion,
+                    'usuario': usuario,
+                    'referencia_tipo': referencia_tipo,
+                    'referencia_id': referencia_id
+                }
+                sync.sync_caja_chica_movimiento_to_supabase(movimiento_dict)
+            except Exception as sync_err:
+                print(f"Error sincronizando mov caja chica: {sync_err}")
+        
+        return mov_id
+    except Exception as e:
+        conn.rollback()
+        print(f"Error registrando movimiento de caja chica: {e}")
+        return None
+    finally:
+        conn.close()
 
 # Crear tablas para egresos e ingresos adicionales
 def crear_tablas_finanzas():
@@ -56,6 +157,7 @@ def mostrar():
     
     # Crear tablas si no existen
     crear_tablas_finanzas()
+    crear_tabla_caja_chica()
     
     # Sincronizar datos desde Supabase al inicio (solo si hay conexión)
     if sync.is_online():
@@ -204,6 +306,10 @@ def mostrar_gestion_financiera():
     
     with subtab1:
         mostrar_resumen_financiero_completo()
+        st.divider()
+        mostrar_caja_chica_panel()
+        st.divider()
+        mostrar_estado_sincronizacion_compacto()
     
     with subtab2:
         mostrar_registro_egresos()
@@ -213,6 +319,115 @@ def mostrar_gestion_financiera():
     
     with subtab4:
         mostrar_historial_financiero()
+
+# =====================
+# CAJA CHICA - UI
+# =====================
+
+def mostrar_caja_chica_panel():
+    st.subheader("🧰 Caja Chica")
+    col_cc1, col_cc2, col_cc3 = st.columns([1,1,2])
+
+    with col_cc1:
+        st.metric("Saldo actual", f"${saldo_caja_chica():.2f}")
+
+    with col_cc2:
+        st.caption("Ingresar o retirar efectivo de caja")
+        mov_tipo = st.selectbox("Tipo de movimiento", ["INGRESO", "EGRESO", "AJUSTE"], key="cc_tipo")
+        monto = st.number_input("Monto", min_value=0.0, step=10.0, format="%.2f", key="cc_monto")
+        descripcion = st.text_input("Descripción", key="cc_desc", placeholder="Motivo (proveedor, sueldo, ajuste, etc.)")
+        if st.button("Registrar en Caja Chica", key="cc_registrar"):
+            if monto > 0:
+                registrar_mov_caja_chica(mov_tipo, monto, descripcion, st.session_state.get('usuario_admin','Sistema'))
+                st.success("Movimiento registrado")
+                st.experimental_rerun()
+            else:
+                st.warning("Indica un monto mayor a 0")
+
+    with col_cc3:
+        st.caption("Movimientos recientes")
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            df = pd.read_sql_query(
+                "SELECT fecha, tipo, monto, descripcion, usuario FROM caja_chica_movimientos ORDER BY fecha DESC LIMIT 20",
+                conn
+            )
+        finally:
+            conn.close()
+        if not df.empty:
+            # Robust datetime parsing for mixed/ISO8601 formats
+            try:
+                df['fecha'] = pd.to_datetime(df['fecha'], format='ISO8601', errors='coerce')
+            except Exception:
+                df['fecha'] = pd.to_datetime(df['fecha'], errors='coerce')
+            st.dataframe(df, hide_index=True, use_container_width=True)
+        else:
+            st.info("Sin movimientos aún")
+
+def _conteos_sqlite():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        tabs = {
+            'egresos_adicionales': 'SELECT COUNT(*) FROM egresos_adicionales',
+            'ingresos_pasivos': 'SELECT COUNT(*) FROM ingresos_pasivos',
+            'caja_chica_movimientos': 'SELECT COUNT(*) FROM caja_chica_movimientos',
+            'ordenes_compra': 'SELECT COUNT(*) FROM ordenes_compra',
+        }
+        res = {}
+        for k,q in tabs.items():
+            cur.execute(q)
+            res[k] = cur.fetchone()[0]
+        return res
+    finally:
+        conn.close()
+
+def _conteos_supabase():
+    # Intentar leer primero de st.secrets si está disponible
+    url = None
+    key = None
+    try:
+        import streamlit as st
+        if 'supabase' in st.secrets:
+            url = st.secrets['supabase'].get('url') or url
+            # Para UI usar anon key; evitar service role en cliente
+            key = st.secrets['supabase'].get('anon_key') or key
+    except Exception:
+        pass
+
+    # Fallback a variables de entorno (.env ya cargado si existe)
+    url = url or os.environ.get('SUPABASE_URL')
+    # Preferir anon key en UI; usar service role solo si no hay anon
+    key = key or os.environ.get('SUPABASE_ANON_KEY') or os.environ.get('SUPABASE_KEY')
+    if not url or not key:
+        return None
+    client = create_client(url, key)
+    res = {}
+    for nombre in ['egresos_adicionales','ingresos_pasivos','caja_chica_movimientos','ordenes_compra']:
+        data = client.table(nombre).select('id', count='exact').execute()
+        res[nombre] = getattr(data, 'count', None)
+    return res
+
+def mostrar_estado_sincronizacion_compacto():
+    st.subheader("🔎 Estado de Sincronización")
+    local = _conteos_sqlite()
+    remoto = _conteos_supabase()
+    if remoto is None:
+        st.info("Configura SUPABASE_URL/SUPABASE_KEY para ver estado.")
+        return
+    pairs = [
+        ("Egresos", local.get('egresos_adicionales',0), remoto.get('egresos_adicionales')),
+        ("Ingresos", local.get('ingresos_pasivos',0), remoto.get('ingresos_pasivos')),
+        ("Caja Chica", local.get('caja_chica_movimientos',0), remoto.get('caja_chica_movimientos')),
+        ("Órdenes", local.get('ordenes_compra',0), remoto.get('ordenes_compra')),
+    ]
+    cols = st.columns(len(pairs))
+    for i,(label,loc,rem) in enumerate(pairs):
+        delta = (rem - loc) if (rem is not None) else None
+        cols[i].metric(label, f"{rem}", delta=delta)
+        if rem is None or rem < loc:
+            cols[i].error("Desfase")
+
 
 def mostrar_resumen_financiero_completo():
     st.subheader("📊 Resumen Financiero Completo")
@@ -470,10 +685,17 @@ def mostrar_egresos_manuales():
                     help="Selecciona el tipo de gasto"
                 )
                 
+                fuente_egreso = st.selectbox(
+                    "🏦 Fuente de Pago: *",
+                    ["Caja Chica", "Banco"],
+                    help="Selecciona de dónde saldrá el dinero (OBLIGATORIO)"
+                )
+                
                 monto_egreso = st.number_input(
                     "💰 Monto:",
-                    min_value=0.01,
-                    step=0.01,
+                    min_value=1.0,
+                    step=1.0,
+                    format="%.0f",
                     help="Cantidad del gasto en pesos"
                 )
             
@@ -505,12 +727,16 @@ def mostrar_egresos_manuales():
                 try:
                     fecha_egreso_str = fecha_egreso.strftime('%Y-%m-%d %H:%M:%S')
                     cursor.execute('''
-                        INSERT INTO egresos_adicionales (fecha, tipo, descripcion, monto, observaciones)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (fecha_egreso_str, tipo_egreso, descripcion_egreso, monto_egreso, observaciones_egreso))
+                        INSERT INTO egresos_adicionales (fecha, tipo, descripcion, monto, observaciones, usuario, fuente)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (fecha_egreso_str, tipo_egreso, descripcion_egreso, monto_egreso, observaciones_egreso, st.session_state.get('usuario_admin', 'Sistema'), fuente_egreso))
                     
                     egreso_id = cursor.lastrowid
                     conn.commit()
+                    
+                    # Si el pago es de caja chica, registrar movimiento
+                    if fuente_egreso == "Caja Chica":
+                        registrar_mov_caja_chica('EGRESO', monto_egreso, f"{tipo_egreso}: {descripcion_egreso}", st.session_state.get('usuario_admin', 'Sistema'), tipo_egreso, egreso_id)
                     
                     # Sincronizar a Supabase automáticamente
                     if sync.is_online():
@@ -525,7 +751,8 @@ def mostrar_egresos_manuales():
                                     'descripcion': egreso[3],
                                     'monto': egreso[4],
                                     'observaciones': egreso[5],
-                                    'usuario': egreso[6] if len(egreso) > 6 else 'Sistema'
+                                    'usuario': egreso[6] if len(egreso) > 6 else 'Sistema',
+                                    'fuente': egreso[7] if len(egreso) > 7 else 'Banco'
                                 }
                                 sync.sync_egreso_to_supabase(egreso_dict)
                         except Exception as sync_error:
@@ -579,17 +806,39 @@ def mostrar_egresos_manuales():
         else:
             st.info("No hay egresos registrados este mes")
     
-    # Tabla de egresos recientes
+    # Tabla de egresos recientes (incluyendo todos los egresos del sistema)
     st.divider()
     st.subheader("📋 Egresos Recientes")
     
     conn = sqlite3.connect(DB_PATH)
     try:
+        # Unión de egresos adicionales y egresos de órdenes de compra
         egresos_recientes_query = """
-            SELECT fecha, tipo, descripcion, monto, observaciones
-            FROM egresos_adicionales 
+            SELECT 
+                fecha,
+                tipo,
+                descripcion,
+                monto,
+                COALESCE(fuente, 'N/A') as fuente,
+                observaciones,
+                'Manual' as origen
+            FROM egresos_adicionales
+            
+            UNION ALL
+            
+            SELECT 
+                oc.fecha_pago as fecha,
+                'Orden de Compra' as tipo,
+                'Orden #' || oc.id || ' - Pedido #' || COALESCE(oc.pedido_id, 'N/A') as descripcion,
+                oc.total_orden as monto,
+                'Pago de Orden' as fuente,
+                oc.notas as observaciones,
+                'Orden Compra' as origen
+            FROM ordenes_compra oc
+            WHERE oc.estado = 'PAGADA' AND oc.fecha_pago IS NOT NULL
+            
             ORDER BY fecha DESC 
-            LIMIT 10
+            LIMIT 20
         """
         
         egresos_recientes_df = pd.read_sql_query(egresos_recientes_query, conn)
@@ -597,8 +846,14 @@ def mostrar_egresos_manuales():
         conn.close()
     
     if not egresos_recientes_df.empty:
-        # Formatear fecha para mejor visualización
-        egresos_recientes_df['fecha'] = pd.to_datetime(egresos_recientes_df['fecha']).dt.strftime('%d/%m/%Y %H:%M')
+        # Formatear fecha para mejor visualización (ISO8601/mixed safe)
+        try:
+            egresos_recientes_df['fecha'] = pd.to_datetime(
+                egresos_recientes_df['fecha'], format='ISO8601', errors='coerce'
+            )
+        except Exception:
+            egresos_recientes_df['fecha'] = pd.to_datetime(egresos_recientes_df['fecha'], errors='coerce')
+        egresos_recientes_df['fecha'] = egresos_recientes_df['fecha'].dt.strftime('%d/%m/%Y %H:%M')
         
         st.dataframe(
             egresos_recientes_df,
@@ -607,6 +862,8 @@ def mostrar_egresos_manuales():
                 "tipo": "💸 Tipo",
                 "descripcion": "📋 Descripción",
                 "monto": st.column_config.NumberColumn("💰 Monto", format="$%.2f"),
+                "fuente": "🏦 Fuente",
+                "origen": "📍 Origen",
                 "observaciones": "📝 Observaciones"
             },
             hide_index=True,
@@ -894,10 +1151,17 @@ def mostrar_registro_ingresos():
                     help="Descripción del tipo de ingreso pasivo"
                 )
                 
+                fuente_ingreso = st.selectbox(
+                    "🏦 Destino del Ingreso: *",
+                    ["Caja Chica", "Banco"],
+                    help="Selecciona a dónde llegará el dinero (OBLIGATORIO)"
+                )
+                
                 monto_ingreso = st.number_input(
                     "💰 Monto:",
-                    min_value=0.01,
-                    step=0.01,
+                    min_value=1.0,
+                    step=1.0,
+                    format="%.0f",
                     help="Cantidad del ingreso en pesos"
                 )
             
@@ -923,12 +1187,16 @@ def mostrar_registro_ingresos():
                 try:
                     fecha_ingreso_str = fecha_ingreso.strftime('%Y-%m-%d %H:%M:%S')
                     cursor.execute('''
-                        INSERT INTO ingresos_pasivos (fecha, descripcion, monto, observaciones)
-                        VALUES (?, ?, ?, ?)
-                    ''', (fecha_ingreso_str, descripcion_ingreso, monto_ingreso, observaciones_ingreso))
+                        INSERT INTO ingresos_pasivos (fecha, descripcion, monto, observaciones, usuario, fuente)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (fecha_ingreso_str, descripcion_ingreso, monto_ingreso, observaciones_ingreso, st.session_state.get('usuario_admin', 'Sistema'), fuente_ingreso))
                     
                     ingreso_id = cursor.lastrowid
                     conn.commit()
+                    
+                    # Si el ingreso es a caja chica, registrar movimiento
+                    if fuente_ingreso == "Caja Chica":
+                        registrar_mov_caja_chica('INGRESO', monto_ingreso, f"Ingreso pasivo: {descripcion_ingreso}", st.session_state.get('usuario_admin', 'Sistema'), 'IngresosPasivos', ingreso_id)
                     
                     # Sincronizar a Supabase automáticamente
                     if sync.is_online():
@@ -942,7 +1210,8 @@ def mostrar_registro_ingresos():
                                     'descripcion': ingreso[2],
                                     'monto': ingreso[3],
                                     'observaciones': ingreso[4],
-                                    'usuario': ingreso[5] if len(ingreso) > 5 else 'Sistema'
+                                    'usuario': ingreso[5] if len(ingreso) > 5 else 'Sistema',
+                                    'fuente': ingreso[6] if len(ingreso) > 6 else 'Banco'
                                 }
                                 sync.sync_ingreso_to_supabase(ingreso_dict)
                         except Exception as sync_error:
@@ -1010,8 +1279,14 @@ def mostrar_registro_ingresos():
         conn.close()
     
     if not ingresos_recientes_df.empty:
-        # Formatear fecha para mejor visualización
-        ingresos_recientes_df['fecha'] = pd.to_datetime(ingresos_recientes_df['fecha']).dt.strftime('%d/%m/%Y %H:%M')
+        # Formatear fecha para mejor visualización (ISO8601/mixed safe)
+        try:
+            ingresos_recientes_df['fecha'] = pd.to_datetime(
+                ingresos_recientes_df['fecha'], format='ISO8601', errors='coerce'
+            )
+        except Exception:
+            ingresos_recientes_df['fecha'] = pd.to_datetime(ingresos_recientes_df['fecha'], errors='coerce')
+        ingresos_recientes_df['fecha'] = ingresos_recientes_df['fecha'].dt.strftime('%d/%m/%Y %H:%M')
         
         st.dataframe(
             ingresos_recientes_df,

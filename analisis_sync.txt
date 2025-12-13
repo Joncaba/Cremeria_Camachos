@@ -1,0 +1,134 @@
+================================================================================
+ANALISIS DE SINCRONIZACION - TABLAS SQLite vs Supabase
+================================================================================
+
+1. TABLAS EN SQLite LOCAL:
+--------------------------------------------------------------------------------
+  bascula_mapeo                  NO en Supabase       SIN sync
+  caja_chica_movimientos         En Supabase          Con Sync
+  codigos_barras                 NO en Supabase       SIN sync
+  creditos_pendientes            En Supabase          Con Sync
+  devoluciones                   En Supabase          Con Sync
+  egresos_adicionales            En Supabase          Con Sync
+  ingresos_pasivos               En Supabase          Con Sync
+  ordenes_compra                 En Supabase          Con Sync
+  pedidos                        En Supabase          Con Sync
+  pedidos_items                  En Supabase          SIN sync individual
+  pedidos_reabastecimiento       NO en Supabase       SIN sync
+  plu_catalogo                   NO en Supabase       SIN sync
+  productos                      NO en Supabase       Con Sync
+  sesiones                       NO en Supabase       SIN sync (OK - local)
+  turnos                         NO en Supabase       SIN sync
+  usuarios                       NO en Supabase       SIN sync
+  usuarios_admin                 NO en Supabase       Con Sync
+  ventas                         En Supabase          Con Sync
+
+2. TABLAS QUE NECESITAN ESTAR EN SUPABASE PERO NO ESTAN:
+--------------------------------------------------------------------------------
+  bascula_mapeo                  (configuracion - puede ser solo local)
+  codigos_barras                 (catalogo - evaluar si compartir)
+  pedidos_reabastecimiento       (verificar vs tabla pedidos)
+  plu_catalogo                   (catalogo - evaluar si compartir)
+  productos                      (CRITICO - tiene sync pero NO tabla Supabase)
+  turnos                         (CRITICO - datos de caja)
+  usuarios                       (separada de usuarios_admin)
+
+3. TABLAS CON SINCRONIZACION IMPLEMENTADA:
+--------------------------------------------------------------------------------
+  caja_chica_movimientos         SQLite: Si   Supabase: Si
+  creditos_pendientes            SQLite: Si   Supabase: Si
+  devoluciones                   SQLite: Si   Supabase: Si
+  egresos_adicionales            SQLite: Si   Supabase: Si
+  ingresos_pasivos               SQLite: Si   Supabase: Si
+  ordenes_compra                 SQLite: Si   Supabase: Si
+  pedidos                        SQLite: Si   Supabase: Si
+  productos                      SQLite: Si   Supabase: NO (FALTA TABLA)
+  usuarios_admin                 SQLite: Si   Supabase: NO (FALTA TABLA)
+  ventas                         SQLite: Si   Supabase: Si
+
+4. TABLAS SIN SINCRONIZACION (potencial perdida de datos):
+--------------------------------------------------------------------------------
+  CRITICO     pedidos_items              (items de pedidos no se sincronizan individualmente)
+  CRITICO     pedidos_reabastecimiento   (sistema antiguo? verificar)
+  CRITICO     turnos                     (cierres de caja - datos financieros)
+  CRITICO     usuarios                   (tabla separada de usuarios_admin)
+  REVISAR     bascula_mapeo              (configuracion local - probablemente OK)
+  REVISAR     codigos_barras             (catalogo de codigos de barra)
+  REVISAR     plu_catalogo               (catalogo PLU)
+
+5. PROBLEMAS DETECTADOS Y RECOMENDACIONES:
+--------------------------------------------------------------------------------
+
+PROBLEMA 1: TABLAS CON SYNC PERO SIN TABLA EN SUPABASE
+  - productos: Tiene sync_producto_to_supabase PERO NO existe tabla en Supabase
+    ACCION: Crear tabla productos en Supabase
+  
+  - usuarios_admin: Tiene sync_usuario_to_supabase PERO NO existe tabla en Supabase
+    ACCION: Crear tabla usuarios_admin en Supabase
+
+PROBLEMA 2: TABLAS CRITICAS SIN SINCRONIZACION
+  - turnos: Datos de cierre de caja, critico para finanzas
+    ACCION: Implementar sync_turno_to_supabase + crear tabla en Supabase
+  
+  - pedidos_items: Items individuales de pedidos no se sincronizan
+    ACCION: Implementar sync_pedido_item_to_supabase (actualmente solo se sincroniza pedidos)
+  
+  - usuarios: Tabla separada de usuarios_admin (verificar si es necesaria)
+    ACCION: Evaluar si usuarios y usuarios_admin deben unificarse
+
+PROBLEMA 3: TABLAS AUXILIARES/CATALOGO SIN SYNC
+  - codigos_barras y plu_catalogo: Catalogos que podrian compartirse entre dispositivos
+    ACCION: Evaluar si es necesario sincronizar (probablemente SI para multi-dispositivo)
+  
+  - bascula_mapeo: Configuracion de mapeo de bascula
+    ACCION: Probablemente OK solo local, a menos que usen multiples dispositivos
+
+PROBLEMA 4: TABLA DUPLICADA/DEPRECADA?
+  - pedidos_reabastecimiento vs pedidos: Parecen ser lo mismo
+    ACCION: Verificar cual se usa actualmente y deprecar la otra
+
+6. PLAN DE ACCION INMEDIATO:
+--------------------------------------------------------------------------------
+PRIORIDAD ALTA (datos criticos):
+  [ ] 1. Crear tabla productos en Supabase
+  [ ] 2. Crear tabla usuarios_admin en Supabase
+  [ ] 3. Crear tabla turnos en Supabase + implementar sync
+  [ ] 4. Implementar sync individual para pedidos_items
+  
+PRIORIDAD MEDIA (mejorar consistencia):
+  [ ] 5. Evaluar unificar usuarios y usuarios_admin
+  [ ] 6. Deprecar pedidos_reabastecimiento si es duplicado
+  [ ] 7. Agregar sync para codigos_barras y plu_catalogo
+  
+PRIORIDAD BAJA (configuracion):
+  [ ] 8. Evaluar si bascula_mapeo necesita sync multi-dispositivo
+
+7. VERIFICACION DE DUPLICACION DE DATOS:
+--------------------------------------------------------------------------------
+RIESGO BAJO: El sistema usa INSERT...ON CONFLICT para upserts RPC, lo que previene
+duplicacion en Supabase. Sin embargo, los siguientes escenarios pueden causar problemas:
+
+  - Si productos y usuarios_admin NO existen en Supabase pero el codigo intenta
+    sincronizar, los datos se PIERDEN (no se guardan en ninguna parte remota)
+  
+  - pedidos_items se sincroniza solo cuando se sincroniza el pedido completo,
+    si se modifica un item individual NO se sincroniza automaticamente
+  
+  - turnos NO se sincronizan, cada dispositivo tiene su propia version local
+
+8. TABLAS QUE ESTAN CORRECTAMENTE SINCRONIZADAS:
+--------------------------------------------------------------------------------
+  ventas                    OK
+  creditos_pendientes       OK
+  egresos_adicionales       OK
+  ingresos_pasivos          OK
+  pedidos                   OK (pero falta pedidos_items)
+  ordenes_compra            OK
+  caja_chica_movimientos    OK (recien agregado)
+  devoluciones              OK (recien agregado)
+
+================================================================================
+CONCLUSION: Sistema parcialmente sincronizado. Hay 2 tablas criticas (productos,
+usuarios_admin) con codigo de sync pero sin tabla destino en Supabase, lo que
+causa PERDIDA DE DATOS. Ademas, turnos y pedidos_items necesitan sync urgente.
+================================================================================

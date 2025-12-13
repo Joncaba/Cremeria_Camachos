@@ -82,6 +82,93 @@ def busqueda_flexible(texto_busqueda, texto_objetivo):
     
     return busqueda_norm in objetivo_norm
 
+# === DEVOLUCIONES (COMPARTIDO CON INVENTARIO) ===
+
+def crear_tabla_devoluciones():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS devoluciones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                codigo_producto TEXT NOT NULL,
+                nombre_producto TEXT NOT NULL,
+                cantidad REAL NOT NULL,
+                unidad TEXT NOT NULL,
+                precio REAL NOT NULL,
+                total REAL NOT NULL,
+                fuente TEXT DEFAULT 'Caja Chica',
+                estado TEXT DEFAULT 'PENDIENTE',
+                notas TEXT,
+                egreso_id INTEGER
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def obtener_devoluciones(estado: str | None = None):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if estado:
+            df = pd.read_sql_query("SELECT * FROM devoluciones WHERE estado = ? ORDER BY fecha DESC", conn, params=(estado,))
+        else:
+            df = pd.read_sql_query("SELECT * FROM devoluciones ORDER BY fecha DESC", conn)
+    finally:
+        conn.close()
+    return df
+
+def completar_devolucion(devolucion_id: int):
+    """Marca devolución como COMPLETADA y reintegra al stock según unidad."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT codigo_producto, cantidad, unidad FROM devoluciones WHERE id = ? AND estado = 'PENDIENTE'", (devolucion_id,))
+        row = cur.fetchone()
+        if not row:
+            return False, "Devolución no encontrada o ya completada"
+        codigo, cantidad, unidad = row
+        if unidad == 'kg':
+            cur.execute("UPDATE productos SET stock_kg = COALESCE(stock_kg,0) + ? WHERE codigo = ?", (cantidad, codigo))
+        else:
+            cur.execute("UPDATE productos SET stock = COALESCE(stock,0) + ? WHERE codigo = ?", (int(cantidad), codigo))
+        cur.execute("UPDATE devoluciones SET estado = 'COMPLETADA' WHERE id = ?", (devolucion_id,))
+        conn.commit()
+        
+        # Sincronizar a Supabase
+        if sync.is_online():
+            try:
+                cur.execute("SELECT * FROM devoluciones WHERE id = ?", (devolucion_id,))
+                row = cur.fetchone()
+                if row:
+                    dev_dict = {
+                        'id': row[0],
+                        'fecha': row[1],
+                        'codigo_producto': row[2],
+                        'nombre_producto': row[3],
+                        'cantidad': row[4],
+                        'unidad': row[5],
+                        'precio': row[6],
+                        'total': row[7],
+                        'fuente': row[8],
+                        'estado': 'COMPLETADA',
+                        'notas': row[10],
+                        'egreso_id': row[11]
+                    }
+                    sync.sync_devolucion_to_supabase(dev_dict)
+            except Exception as sync_err:
+                print(f"Error sincronizando devolución completada: {sync_err}")
+        
+        return True, "Devolución completada y stock actualizado"
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
 # === SISTEMA DE AUTENTICACIÓN PARA ADMINISTRACIÓN ===
 
 def hash_password(password):
@@ -884,7 +971,7 @@ def mostrar():
     st.divider()
     
     # === PESTAÑAS PRINCIPALES ===
-    tab1, tab2, tab3 = st.tabs(["🚨 Productos con Stock Bajo", "📝 Gestionar Pedidos", "📊 Resumen y Estadísticas"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🚨 Productos con Stock Bajo", "📝 Gestionar Pedidos", "📊 Resumen y Estadísticas", "🔁 Devoluciones"])
     
     with tab1:
         col_titulo, col_refresh = st.columns([4, 1])
@@ -1464,3 +1551,46 @@ def mostrar():
                     st.write("**Top 5 Proveedores:**")
                     for proveedor, count in proveedores.items():
                         st.write(f"• {proveedor}: {count} pedidos")
+
+    # =====================
+    # TAB 4: DEVOLUCIONES
+    # =====================
+    with tab4:
+        st.subheader("🔁 Devoluciones")
+        crear_tabla_devoluciones()
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            estado_sel = st.selectbox("Estado", ["PENDIENTE", "COMPLETADA", "Todas"], index=0)
+        with col_f2:
+            st.caption("Marca como completada para reintegrar al stock")
+
+        if estado_sel == "Todas":
+            devs = obtener_devoluciones()
+        else:
+            devs = obtener_devoluciones(estado_sel)
+
+        if devs.empty:
+            st.info("Sin devoluciones registradas")
+        else:
+            for _, d in devs.iterrows():
+                cols = st.columns([3,2,2,2,2])
+                with cols[0]:
+                    st.write(f"{d['fecha']} • {d['nombre_producto']} ({d['codigo_producto']})")
+                with cols[1]:
+                    st.write(f"Cantidad: {d['cantidad']:.2f} {d['unidad']}")
+                with cols[2]:
+                    st.write(f"Precio: ${d['precio']:.2f}")
+                with cols[3]:
+                    st.write(f"Total: ${d['total']:.2f}")
+                with cols[4]:
+                    if d['estado'] == 'PENDIENTE' and verificar_sesion_admin():
+                        if st.button("Completar", key=f"comp_dev_{d['id']}"):
+                            ok, msg = completar_devolucion(int(d['id']))
+                            if ok:
+                                st.success("✅ "+msg)
+                                time.sleep(0.5)
+                                st.rerun()
+                            else:
+                                st.error("❌ "+msg)
+                    else:
+                        st.write(d['estado'])

@@ -996,6 +996,56 @@ class SyncManager:
         except Exception as e:
             print(f"Error al sincronizar usuarios desde Supabase: {e}")
             return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    # ===== SINCRONIZACIÓN CAJA CHICA =====
+    
+    def sync_caja_chica_movimiento_to_supabase(self, movimiento_data: Dict) -> tuple[bool, str]:
+        """Sincronizar un movimiento de caja chica a Supabase usando RPC upsert"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            # Convertir datetime a ISO string si existe
+            if 'created_at' in movimiento_data and isinstance(movimiento_data['created_at'], datetime):
+                movimiento_data['created_at'] = movimiento_data['created_at'].isoformat()
+            
+            # Llamar función RPC upsert_caja_chica_movimiento
+            result = self.supabase_db.client.rpc('upsert_caja_chica_movimiento', {'_row': movimiento_data}).execute()
+            
+            if result.data is not None:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar movimiento caja chica a Supabase: {error_msg}")
+            return False, error_msg
+    
+    # ===== SINCRONIZACIÓN DEVOLUCIONES =====
+    
+    def sync_devolucion_to_supabase(self, devolucion_data: Dict) -> tuple[bool, str]:
+        """Sincronizar una devolución a Supabase usando RPC upsert"""
+        if not self.is_online():
+            return False, "Sin conexión a internet"
+        
+        try:
+            # Convertir datetime a ISO string si existe
+            if 'fecha' in devolucion_data and isinstance(devolucion_data['fecha'], datetime):
+                devolucion_data['fecha'] = devolucion_data['fecha'].isoformat()
+            
+            # Llamar función RPC upsert_devolucion
+            result = self.supabase_db.client.rpc('upsert_devolucion', {'_row': devolucion_data}).execute()
+            
+            if result.data is not None:
+                return True, ""
+            else:
+                return False, "Supabase no retornó datos"
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error al sincronizar devolución a Supabase: {error_msg}")
+            return False, error_msg
 
 # Instancia global del gestor de sincronización
 _sync_manager = None

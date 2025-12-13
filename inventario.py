@@ -14,6 +14,7 @@ import config
 from db_adapter import get_db_adapter
 from sync_manager import get_sync_manager
 from auth_manager import verificar_sesion_admin, cerrar_sesion_admin, obtener_tiempo_restante, mostrar_formulario_login
+from sync_supabase_to_sqlite import auto_sync_inventario_on_load
 
 DB_PATH = "pos_cremeria.db"
 
@@ -94,6 +95,134 @@ def crear_admin_por_defecto():
 # Inicializar sistema de usuarios - DEPRECADO (ahora se usa usuarios.py)
 # crear_tabla_usuarios()
 # admin_creado = crear_admin_por_defecto()
+
+# =====================
+# DEVOLUCIONES - MODELO
+# =====================
+
+def crear_tabla_devoluciones():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS devoluciones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                codigo_producto TEXT NOT NULL,
+                nombre_producto TEXT NOT NULL,
+                cantidad REAL NOT NULL,
+                unidad TEXT NOT NULL,
+                precio REAL NOT NULL,
+                total REAL NOT NULL,
+                fuente TEXT DEFAULT 'Caja Chica',
+                estado TEXT DEFAULT 'PENDIENTE',
+                notas TEXT,
+                egreso_id INTEGER
+            )
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error creando tabla devoluciones: {e}")
+    finally:
+        conn.close()
+
+
+def registrar_devolucion(codigo: str, nombre: str, cantidad: float, unidad: str, precio: float,
+                         fuente: str, notas: str = "", usuario: str = "Sistema"):
+    """Registra una devolución de producto y crea un egreso asociado"""
+    try:
+        # Validar parámetros
+        if not codigo or not nombre:
+            print(f"Error: Parámetros inválidos - codigo='{codigo}', nombre='{nombre}'")
+            return False
+        
+        total = float(cantidad) * float(precio)
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        egreso_id = None
+        
+        try:
+            # Registrar egreso por la devolución para que afecte utilidad
+            cur.execute(
+                """
+                INSERT INTO egresos_adicionales (fecha, tipo, descripcion, monto, observaciones, usuario, fuente)
+                VALUES (CURRENT_TIMESTAMP, 'Devolución', ?, ?, ?, ?, ?)
+                """,
+                (f"Devolución {nombre} ({cantidad} {unidad})", total, notas, usuario, fuente)
+            )
+            egreso_id = cur.lastrowid
+            print(f"Egreso registrado: ID = {egreso_id}")
+
+            # Insertar devolución
+            cur.execute(
+                """
+                INSERT INTO devoluciones (codigo_producto, nombre_producto, cantidad, unidad, precio, total, fuente, notas, egreso_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (codigo, nombre, cantidad, unidad, precio, total, fuente, notas, egreso_id)
+            )
+            
+            devolucion_id = cur.lastrowid
+            print(f"Devolución registrada: ID = {devolucion_id}")
+
+            # Si la fuente es caja chica, registrar movimiento en caja chica
+            if fuente.lower().startswith('caja'):
+                try:
+                    from finanzas import registrar_mov_caja_chica
+                    mov_id = registrar_mov_caja_chica('EGRESO', total, f"Devolución {nombre}", usuario, 'Devolucion', egreso_id)
+                    print(f"Movimiento caja chica registrado: ID = {mov_id}")
+                except Exception as caja_err:
+                    print(f"Advertencia: Error registrando movimiento en caja chica: {caja_err}")
+                    # Continuar aunque falle el registro en caja chica (no bloquea la devolución)
+
+            conn.commit()
+            print("Transacción en SQLite completada exitosamente")
+            
+            # Sincronizar a Supabase
+            try:
+                from sync_manager import get_sync_manager
+                sync = get_sync_manager()
+                if sync.is_online():
+                    devolucion_dict = {
+                        'id': devolucion_id,
+                        'codigo_producto': codigo,
+                        'nombre_producto': nombre,
+                        'cantidad': cantidad,
+                        'unidad': unidad,
+                        'precio': precio,
+                        'total': total,
+                        'fuente': fuente,
+                        'estado': 'PENDIENTE',
+                        'notas': notas,
+                        'egreso_id': egreso_id
+                    }
+                    success, msg = sync.sync_devolucion_to_supabase(devolucion_dict)
+                    print(f"Sincronización Supabase: {success} - {msg}")
+                else:
+                    print("Sin conexión a Supabase, devolución registrada solo localmente")
+            except Exception as sync_err:
+                print(f"Advertencia: Error sincronizando devolución: {sync_err}")
+                # No bloquear aunque falle la sincronización
+            
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"Error en transacción de devolución: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            conn.close()
+    
+    except Exception as e:
+        print(f"Error registrando devolución (nivel superior): {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def actualizar_base_datos_granel():
     """Migración para agregar soporte de productos a granel"""
@@ -399,11 +528,15 @@ def buscar_producto_por_codigo_o_nombre(busqueda, productos_df):
 
 def obtener_sugerencias_productos(busqueda, productos_df, max_sugerencias=5):
     """Obtener sugerencias de productos basadas en la búsqueda flexible"""
-    if not busqueda or len(busqueda) < 2:
+    if not busqueda or len(busqueda) < 1:
         return []
     
     sugerencias = []
     productos_encontrados = set()
+    
+    # Normalizar búsqueda
+    busqueda_norm = normalizar_texto(busqueda)
+    palabras_busqueda = busqueda_norm.split()
     
     # Buscar por código y nombre usando búsqueda flexible
     for _, producto in productos_df.iterrows():
@@ -417,10 +550,17 @@ def obtener_sugerencias_productos(busqueda, productos_df, max_sugerencias=5):
         if codigo in productos_encontrados:
             continue
         
-        # Buscar en código o nombre con búsqueda flexible
-        if (busqueda_flexible(busqueda, codigo) or 
-            busqueda_flexible(busqueda, nombre)):
-            
+        # Normalizar para comparación
+        codigo_norm = normalizar_texto(codigo)
+        nombre_norm = normalizar_texto(nombre)
+        
+        # Buscar en código (búsqueda exacta o parcial)
+        codigo_coincide = codigo_norm.startswith(busqueda_norm) or busqueda_norm in codigo_norm
+        
+        # Buscar en nombre (cualquiera de las palabras debe coincidir)
+        nombre_coincide = any(palabra in nombre_norm for palabra in palabras_busqueda)
+        
+        if codigo_coincide or nombre_coincide:
             tipo = "🏷️" if producto.get('tipo_venta', 'unidad') == 'unidad' else "⚖️"
             sugerencias.append(f"{tipo} {codigo} - {nombre}")
             productos_encontrados.add(codigo)
@@ -647,8 +787,13 @@ def mostrar(modo_lectura=False):
         # No mostrar el resto del contenido mientras se muestra el login
         return
     
-    # Crear tabla de stock mínimo si no existe
+    # Crear tablas necesarias
     crear_tabla_stock_minimo()
+    crear_tabla_devoluciones()
+    
+    # 🔄 SINCRONIZACIÓN BIDIRECCIONAL: Traer cambios de Supabase
+    # Si alguien cambió precios/stock en Supabase, se reflejan aquí automáticamente
+    auto_sync_inventario_on_load()
     
     # IMPORTANTE: Forzar recarga de datos cada vez que se muestra la página
     # Esto asegura que siempre veamos los datos más recientes
@@ -1050,103 +1195,6 @@ def mostrar(modo_lectura=False):
             )
     else:
         st.info("No hay productos en el inventario")
-    
-    # Separador
-    st.divider()
-    
-    # 3. Análisis Visual
-    st.subheader("📊 Análisis Visual")
-    
-    if not productos_df.empty:
-        col_grafico1, col_grafico2 = st.columns(2)
-        
-        with col_grafico1:
-            # Gráfico de stock actual
-            fig_stock = px.bar(
-                productos_df.head(10), 
-                x='nombre', 
-                y='stock', 
-                title='Stock Actual (Top 10 productos)',
-                color='stock',
-                color_continuous_scale='RdYlGn'
-            )
-            fig_stock.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_stock, use_container_width=True)
-        
-        with col_grafico2:
-            # Gráfico de estado del stock
-            if 'estado_stock' in productos_df.columns:
-                # Calcular estado del stock para el gráfico
-                def calcular_estado_stock(row):
-                    if row.get('tipo_venta', 'unidad') in ['granel', 'kg']:
-                        stock_actual = row.get('stock_kg', 0)
-                        stock_min = row.get('stock_minimo_kg', 0)
-                    else:
-                        stock_actual = row.get('stock', 0)
-                        stock_min = row.get('stock_minimo', 10)
-                    
-                    if stock_min > 0:
-                        if stock_actual <= (stock_min * 0.5):
-                            return '🔴 CRÍTICO'
-                        elif stock_actual <= stock_min:
-                            return '🟡 BAJO'
-                        else:
-                            return '🟢 NORMAL'
-                    return '🟢 NORMAL'
-                
-                productos_df['estado_stock'] = productos_df.apply(calcular_estado_stock, axis=1)
-                estado_counts = productos_df['estado_stock'].value_counts()
-                
-                if not estado_counts.empty:
-                    fig_estados = px.pie(
-                        values=estado_counts.values,
-                        names=estado_counts.index,
-                        title='Distribución del Estado del Stock',
-                        color_discrete_map={
-                            '🔴 CRÍTICO': '#ff4757',
-                            '🟡 BAJO': '#ffa502',
-                            '🟢 NORMAL': '#2ed573'
-                        }
-                    )
-                    st.plotly_chart(fig_estados, use_container_width=True)
-        
-        # Gráfico adicional: Productos por tipo de venta
-        col_grafico3, col_grafico4 = st.columns(2)
-        
-        with col_grafico3:
-            if 'tipo_venta' in productos_df.columns:
-                tipo_venta_counts = productos_df['tipo_venta'].value_counts()
-                if not tipo_venta_counts.empty:
-                    fig_tipos = px.bar(
-                        x=tipo_venta_counts.index,
-                        y=tipo_venta_counts.values,
-                        title='Productos por Tipo de Venta',
-                        labels={'x': 'Tipo de Venta', 'y': 'Cantidad de Productos'},
-                        color=tipo_venta_counts.values,
-                        color_continuous_scale='viridis'
-                    )
-                    st.plotly_chart(fig_tipos, use_container_width=True)
-        
-        with col_grafico4:
-            # Gráfico de valor del inventario por producto
-            if 'precio_compra' in productos_df.columns:
-                productos_df['valor_stock'] = productos_df['stock'] * productos_df['precio_compra']
-                top_valor = productos_df.nlargest(10, 'valor_stock')
-                
-                if not top_valor.empty:
-                    fig_valor = px.bar(
-                        top_valor,
-                        x='nombre',
-                        y='valor_stock',
-                        title='Top 10 - Valor del Stock por Producto',
-                        labels={'valor_stock': 'Valor ($)', 'nombre': 'Producto'},
-                        color='valor_stock',
-                        color_continuous_scale='Blues'
-                    )
-                    fig_valor.update_xaxes(tickangle=45)
-                    st.plotly_chart(fig_valor, use_container_width=True)
-    else:
-        st.info("Agrega productos para ver análisis visual")
     
     # Separador
     st.divider()
@@ -1643,137 +1691,138 @@ def mostrar(modo_lectura=False):
     
     # Separador
     st.divider()
-    
-    # 5. Métricas importantes - Resumen General del Inventario
-    st.subheader("📦 Resumen General de Inventario")
-    
-    # Calcular métricas principales
-    total_productos = len(productos_df) if not productos_df.empty else 0
-    productos_criticos = len(productos_bajo_stock) if not productos_bajo_stock.empty else 0
-    
-    # Valor total del inventario actual (stock actual × precio normal como referencia)
-    if not productos_df.empty:
-        # Asegurar que todos los campos numéricos sean del tipo correcto
-        productos_df['precio_normal'] = pd.to_numeric(productos_df['precio_normal'], errors='coerce').fillna(0)
-        productos_df['stock'] = pd.to_numeric(productos_df['stock'], errors='coerce').fillna(0)
-        productos_df['stock_kg'] = pd.to_numeric(productos_df['stock_kg'], errors='coerce').fillna(0)
-        productos_df['stock_maximo'] = pd.to_numeric(productos_df['stock_maximo'], errors='coerce').fillna(0)
-        productos_df['stock_maximo_kg'] = pd.to_numeric(productos_df['stock_maximo_kg'], errors='coerce').fillna(0)
-        
-        # Calcular valor considerando productos por unidad y por granel
-        # Usar precio_normal como referencia de valor ya que precio_compra está vacío
-        productos_df['valor_actual'] = productos_df.apply(
-            lambda row: (float(row['stock_kg']) * float(row['precio_normal'])) if row['tipo_venta'] in ['granel', 'kg'] 
-                       else (float(row['stock']) * float(row['precio_normal'])),
-            axis=1
-        )
-        valor_inventario_actual = productos_df['valor_actual'].sum()
+
+    # 4.b Devoluciones
+    st.subheader("🔁 Devoluciones")
+    if es_admin:
+        col_dev1, col_dev2 = st.columns([2,1])
+        with col_dev1:
+            busq = st.text_input("Buscar producto por nombre o código", key="dev_busq")
+            seleccionado = None
+            if busq and not productos_df.empty:
+                try:
+                    # obtener_sugerencias_productos devuelve strings formateados, no diccionarios
+                    sugerencias = obtener_sugerencias_productos(busq, productos_df, max_sugerencias=8)
+                except Exception as e:
+                    print(f"Error obteniendo sugerencias: {e}")
+                    sugerencias = []
+                # Las sugerencias ya vienen formateadas como "🏷️ codigo - nombre"
+                pick = st.selectbox("Coincidencias", sugerencias, key="dev_pick") if sugerencias else None
+                if pick:
+                    try:
+                        # Extraer código (después del emoji y espacio, antes del " - ")
+                        # Formato: "🏷️ codigo - nombre" o "⚖️ codigo - nombre"
+                        cod = pick.split(' - ')[0].split(' ')[-1]  # Quitar emoji y tomar código
+                        # Asegurar que el código sea válido (no vacío)
+                        if cod and cod in set(productos_df['codigo'].astype(str)):
+                            seleccionado = productos_df[productos_df['codigo'] == cod].iloc[0].to_dict()
+                        else:
+                            st.error(f"Código inválido extraído: {cod}")
+                    except Exception as e:
+                        st.error(f"Error al procesar selección: {e}")
+                        print(f"Error extrayendo código de '{pick}': {e}")
+
+            if not seleccionado and not productos_df.empty:
+                cod_input = st.text_input("Código exacto (opcional)", key="dev_codigo")
+                if cod_input and (cod_input in set(productos_df['codigo'].astype(str))):
+                    seleccionado = productos_df[productos_df['codigo'].astype(str) == cod_input].iloc[0].to_dict()
+
+            if seleccionado:
+                es_granel = seleccionado.get('tipo_venta') in ['granel','kg']
+                unidad = 'kg' if es_granel else 'unidad'
+                tipo_venta_display = '⚖️ Granel (kg)' if es_granel else '🏷️ Unidad'
+                precio = float(seleccionado.get('precio_por_kg' if es_granel else 'precio_normal', 0) or 0)
+                
+                # Validar que se tiene el código
+                codigo = seleccionado.get('codigo')
+                nombre = seleccionado.get('nombre')
+                
+                if not codigo or not nombre:
+                    st.error(f"Error: Producto incompleto. Código='{codigo}', Nombre='{nombre}'")
+                else:
+                    # Mostrar información del producto con el tipo de venta
+                    st.success(f"✅ Producto encontrado: **{nombre}**")
+                    col_info1, col_info2, col_info3 = st.columns(3)
+                    with col_info1:
+                        st.metric("Código", codigo)
+                    with col_info2:
+                        st.metric("Tipo", tipo_venta_display)
+                    with col_info3:
+                        st.metric(f"Precio/{unidad}", f"${precio:.2f}")
+                    
+                    # Input de cantidad con paso ajustado según tipo de venta
+                    cantidad = st.number_input(
+                        f"Cantidad a devolver ({unidad})",
+                        min_value=0.000,
+                        step=0.001 if es_granel else 1.0,
+                        format="%.3f" if es_granel else "%.0f",
+                        key="dev_cant"
+                    )
+                    
+                    # Fuente y notas
+                    fuente = st.selectbox("Fuente de pago", ["Caja Chica", "Banco", "Otro"], key="dev_fuente")
+                    notas = st.text_input("Notas (opcional)", key="dev_notas")
+                    
+                    # Cálculo y muestra de total
+                    total = cantidad * precio
+                    col_total1, col_total2 = st.columns([2, 1])
+                    with col_total1:
+                        st.metric("Total devolución", f"${total:.2f}")
+                    with col_total2:
+                        st.caption("")  # Espaciador
+                    
+                    # Botón para registrar
+                    if st.button("✅ Agregar devolución", type="primary", key="dev_add", use_container_width=True):
+                        if cantidad > 0 and precio >= 0:
+                            try:
+                                print(f"\n=== INICIANDO REGISTRO DEVOLUCIÓN ===")
+                                print(f"Código: {codigo}, Nombre: {nombre}, Cantidad: {cantidad}, Unidad: {unidad}")
+                                print(f"Precio: {precio}, Fuente: {fuente}, Usuario: {st.session_state.get('usuario_admin','admin')}")
+                                
+                                ok = registrar_devolucion(
+                                    codigo,
+                                    nombre,
+                                    cantidad,
+                                    unidad,
+                                    precio,
+                                    fuente,
+                                    notas,
+                                    st.session_state.get('usuario_admin','admin')
+                                )
+                                
+                                print(f"Resultado registrar_devolucion: {ok}")
+                                
+                                if ok:
+                                    st.success("✅ Devolución registrada exitosamente (pendiente de reintegrar a stock)")
+                                    st.balloons()
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error("❌ No se pudo registrar la devolución. Revisa la consola para detalles.")
+                            except Exception as e:
+                                st.error(f"❌ Error registrando devolución: {str(e)}")
+                                print(f"Error completo: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        else:
+                            st.warning("⚠️ Verifica cantidad y precio")
+        with col_dev2:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                df_dev = pd.read_sql_query(
+                    "SELECT fecha, codigo_producto, nombre_producto, cantidad, unidad, total, estado FROM devoluciones ORDER BY fecha DESC LIMIT 10",
+                    conn
+                )
+            finally:
+                conn.close()
+            st.write("Últimas devoluciones")
+            if not df_dev.empty:
+                st.dataframe(df_dev, hide_index=True, use_container_width=True)
+            else:
+                st.info("Sin devoluciones registradas")
     else:
-        valor_inventario_actual = 0.0
-    
-    # Inversión necesaria para reabastecer productos con stock bajo
-    if not productos_bajo_stock.empty:
-        productos_bajo_stock_copy = productos_bajo_stock.copy()
-        productos_bajo_stock_copy['cantidad_necesaria'] = pd.to_numeric(productos_bajo_stock_copy['cantidad_necesaria'], errors='coerce').fillna(0)
-        productos_bajo_stock_copy['precio_normal'] = pd.to_numeric(productos_bajo_stock_copy['precio_normal'], errors='coerce').fillna(0)
-        inversion_reabastecimiento = (productos_bajo_stock_copy['cantidad_necesaria'] * productos_bajo_stock_copy['precio_normal']).sum()
-    else:
-        inversion_reabastecimiento = 0.0
-    
-    # Ganancia total si se vende todo el inventario actual
-    # Ganancia = (precio_normal - precio_compra) × cantidad_actual
-    if not productos_df.empty:
-        productos_df['precio_compra'] = pd.to_numeric(productos_df['precio_compra'], errors='coerce').fillna(0)
-        productos_df['ganancia_unitaria'] = productos_df['precio_normal'] - productos_df['precio_compra']
-        productos_df['ganancia_total'] = productos_df.apply(
-            lambda row: (float(row['stock_kg']) * float(row['ganancia_unitaria'])) if row['tipo_venta'] in ['granel', 'kg'] 
-                       else (float(row['stock']) * float(row['ganancia_unitaria'])),
-            axis=1
-        )
-        ganancia_inventario_actual = productos_df['ganancia_total'].sum()
-    else:
-        ganancia_inventario_actual = 0.0
-    
-    # Mostrar métricas en columnas
-    col_met1, col_met2, col_met3, col_met4 = st.columns(4)
-    
-    with col_met1:
-        st.metric(
-            "📦 Total de Productos", 
-            total_productos,
-            help="Cantidad total de productos únicos en el inventario"
-        )
-    
-    with col_met2:
-        # Mostrar con mejor formato
-        valor_formateado = f"${valor_inventario_actual:,.2f}"
-        st.metric(
-            "💰 Valor del Inventario Actual", 
-            valor_formateado,
-            help="Valor total del stock actual (cantidad actual × precio de compra)"
-        )
-    
-    with col_met3:
-        st.metric(
-            "🛒 Inversión para Reabastecer", 
-            f"${inversion_reabastecimiento:,.2f}",
-            delta=f"{productos_criticos} productos" if productos_criticos > 0 else "0 productos",
-            delta_color="inverse" if productos_criticos > 0 else "off",
-            help="Inversión necesaria para llevar productos con stock bajo hasta su stock máximo"
-        )
-    
-    with col_met4:
-        st.metric(
-            "💵 Ganancia Potencial", 
-            f"${ganancia_inventario_actual:,.2f}",
-            help="Ganancia total si se vende todo el inventario actual al precio normal"
-        )
-    
-    # Resumen adicional con más detalles
-    st.markdown("---")
-    
-    # Calcular valor máximo potencial para mostrar en detalles
-    if not productos_df.empty:
-        productos_df['valor_maximo'] = productos_df.apply(
-            lambda row: (float(row['stock_maximo_kg']) * float(row['precio_normal'])) if row['tipo_venta'] in ['granel', 'kg'] 
-                       else (float(row['stock_maximo']) * float(row['precio_normal'])),
-            axis=1
-        )
-        valor_inventario_maximo = productos_df['valor_maximo'].sum()
-    else:
-        valor_inventario_maximo = 0.0
-    
-    col_detalle1, col_detalle2, col_detalle3 = st.columns(3)
-    
-    with col_detalle1:
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.2rem; border-radius: 12px; color: white;">
-            <h4 style="margin: 0; color: white;">📊 Estado del Inventario</h4>
-            <p style="font-size: 1.1rem; margin: 0.5rem 0;"><strong>Productos con Stock Bajo:</strong> {}</p>
-            <p style="font-size: 0.9rem; margin: 0;">Productos que necesitan reabastecimiento urgente</p>
-        </div>
-        """.format(productos_criticos), unsafe_allow_html=True)
-    
-    with col_detalle2:
-        porcentaje_llenado = (valor_inventario_actual / valor_inventario_maximo * 100) if valor_inventario_maximo > 0 else 0
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); padding: 1.2rem; border-radius: 12px; color: white;">
-            <h4 style="margin: 0; color: white;">📈 Capacidad del Inventario</h4>
-            <p style="font-size: 1.1rem; margin: 0.5rem 0;"><strong>{:.1f}%</strong> de capacidad utilizada</p>
-            <p style="font-size: 0.9rem; margin: 0;">Espacio disponible para crecimiento</p>
-        </div>
-        """.format(porcentaje_llenado), unsafe_allow_html=True)
-    
-    with col_detalle3:
-        valor_necesario_total = valor_inventario_maximo - valor_inventario_actual
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); padding: 1.2rem; border-radius: 12px; color: white;">
-            <h4 style="margin: 0; color: white;">💵 Inversión Total Faltante</h4>
-            <p style="font-size: 1.1rem; margin: 0.5rem 0;"><strong>${:,.2f}</strong></p>
-            <p style="font-size: 0.9rem; margin: 0;">Para completar inventario al 100%</p>
-        </div>
-        """.format(valor_necesario_total), unsafe_allow_html=True)
-    
+        st.info("Solo administradores pueden registrar devoluciones")
+
     # Separador
     st.divider()
     
