@@ -586,12 +586,22 @@ conn.commit()
 
 def parsear_codigo_bascula(codigo_completo):
     """
-    Parsear tickets con múltiples productos.
-    Formato: 13 dígitos por producto (9 código + 3 peso + 1 checksum)
-    Para productos a granel: primeros 9 dígitos = código, siguientes 3 dígitos = peso en decagramos, último = checksum
-    Ejemplo: 200014001 1100 → código 200014001, peso 110 decagramos = 1100 gramos = 1.100 kg (ignora último 0)
-    Ejemplo: 200000100 0270 + checksum 4 → código 200000100, peso 027 decagramos = 270 gramos = 0.270 kg
-    Retorna: [(codigo, valor_en_gramos), ...]
+    Parsear tickets con múltiples productos de báscula.
+    
+    Formato por producto: 13 dígitos
+    - Primeros 7 dígitos: código del producto (PLU báscula)
+    - Siguiente 1 dígito: cantidad entera (unidades)
+    - Últimos 5 dígitos: peso en formato especial (decagramos × 10)
+    
+    Ejemplos:
+    - 2080332010005 → código 2080332, cantidad 0, peso 10005 → 1.0005 kg (aprox 1 unidad)
+    - 2000072002559 → código 2000072, cantidad 0, peso 02559 → 0.2559 kg = 255.9g
+    - 2000140018758 → código 2000140, cantidad 0, peso 18758 → 1.8758 kg = 1875.8g
+    
+    El peso se convierte: dividir entre 10000 para obtener kilogramos
+    Ejemplo: 02559 / 10000 = 0.2559 kg
+    
+    Retorna: [(codigo_7_digitos, peso_en_gramos), ...]
     """
     if not codigo_completo or len(codigo_completo) < 13:
         return []
@@ -603,31 +613,147 @@ def parsear_codigo_bascula(codigo_completo):
     
     for i in range(num_productos):
         inicio = i * 13
-        codigo_prod = codigo_completo[inicio:inicio+9]  # 9 dígitos para código
-        valor_str = codigo_completo[inicio+9:inicio+12]  # 3 dígitos (ignorar el 4to que es checksum)
-        checksum = codigo_completo[inicio+12:inicio+13]  # El dígito checksum
+        segmento = codigo_completo[inicio:inicio+13]
+        
+        # Extraer las partes según el formato real
+        codigo_prod = segmento[0:7]      # 7 dígitos: código de producto
+        cantidad_dig = segmento[7:8]     # 1 dígito: cantidad entera (usualmente 0 para granel)
+        peso_str = segmento[8:13]        # 5 dígitos: peso en formato especial
         
         # Debug: imprimir qué se está extrayendo
-        print(f"Producto {i+1}: código='{codigo_prod}', valor_str='{valor_str}', checksum='{checksum}', segmento completo='{codigo_completo[inicio:inicio+13]}'")
+        print(f"Producto {i+1}: segmento='{segmento}' → codigo='{codigo_prod}', cant='{cantidad_dig}', peso_str='{peso_str}'")
         
         try:
-            valor_int = int(valor_str)
-            # Si el valor es >= 200, ya está en gramos directamente
-            # Si el valor es < 200, está en decagramos (multiplicar por 10)
-            if valor_int >= 200:
-                valor = valor_int  # 270 = 270 gramos
-            else:
-                valor = valor_int * 10  # 110 = 1100 gramos
-            productos.append((codigo_prod, valor))
+            # Convertir peso: dividir entre 10000 y multiplicar por 1000 para obtener gramos
+            # Ejemplo: 02559 → 2559/10000 = 0.2559 kg = 255.9 g
+            peso_int = int(peso_str)
+            peso_gramos = (peso_int / 10000) * 1000  # Convertir a gramos
+            productos.append((codigo_prod, int(peso_gramos)))
         except ValueError:
+            print(f"  ⚠️ Error al parsear peso: '{peso_str}'")
             continue
     
     return productos
 
 def obtener_producto_por_codigo(codigo):
-    """Obtener información completa del producto por código"""
-    cursor.execute("SELECT * FROM productos WHERE codigo = ?", (codigo,))
-    return cursor.fetchone()
+    """
+    Obtener información completa del producto por código.
+    Maneja múltiples formatos de búsqueda:
+    
+    Formato de báscula: 2080332010005
+      - Primeros 7 dígitos: código del producto (2080332)
+        * Si comienza con "20": extraer últimos 5-6 dígitos como PLU
+        * Ejemplo: 2000072 → PLU 72, 2000140 → PLU 140, 2080332 → PLU 80332
+      - Siguientes 2 dígitos: cantidad (01)
+      - Últimos 4 dígitos: peso en gramos (0005)
+    
+    Estrategias de búsqueda:
+    1. Búsqueda exacta por código
+    2. Búsqueda por número_producto (PLU)
+    3. Extracción de PLU desde código de báscula (7 dígitos)
+    4. Búsqueda en mapeo de báscula (tabla auxiliar)
+    5. Búsqueda parcial con LIKE
+    6. Búsqueda flexible para barcodes truncados
+    """
+    if not codigo:
+        return None
+    
+    codigo_str = str(codigo).strip()
+    
+    # ESTRATEGIA 0A: Si el código tiene 7 dígitos y comienza con "20" (código de báscula)
+    # Primero buscar en tabla de mapeo, luego intentar extraer PLU
+    if len(codigo_str) == 7 and codigo_str.startswith('20') and codigo_str.isdigit():
+        # PRIMERO: Buscar en mapeo (tiene prioridad)
+        cursor.execute("""
+            SELECT p.* FROM productos p
+            JOIN bascula_mapeo bm ON p.codigo = bm.producto_codigo
+            WHERE bm.codigo_bascula = ?
+        """, (codigo_str,))
+        resultado = cursor.fetchone()
+        if resultado:
+            return resultado
+        
+        # SEGUNDO: Extraer PLU de los últimos dígitos
+        # Ejemplos:
+        # 2000072 → probar 72, 0072, 00072
+        # 2000140 → probar 140, 0140, 00140
+        # 2080332 → probar 80332, 0332, 332
+        
+        for longitud in [5, 4, 3, 2]:
+            plu_str = codigo_str[-longitud:].lstrip('0') or '0'
+            try:
+                plu = int(plu_str)
+                cursor.execute("SELECT * FROM productos WHERE numero_producto = ?", (plu,))
+                resultado = cursor.fetchone()
+                if resultado:
+                    return resultado
+            except ValueError:
+                continue
+    
+    # ESTRATEGIA 0B: Si el código tiene 13 dígitos (ticket completo)
+    if len(codigo_str) == 13 and codigo_str.isdigit():
+        codigo_bascula = codigo_str[:7]
+        # Usar la estrategia de 7 dígitos recursivamente
+        return obtener_producto_por_codigo(codigo_bascula)
+    
+    # ESTRATEGIA 1: Búsqueda exacta por código
+    cursor.execute("SELECT * FROM productos WHERE codigo = ?", (codigo_str,))
+    resultado = cursor.fetchone()
+    if resultado:
+        return resultado
+    
+    # ESTRATEGIA 2: Si es un número, buscar por numero_producto (PLU)
+    try:
+        codigo_int = int(codigo_str)
+        cursor.execute("SELECT * FROM productos WHERE numero_producto = ?", (codigo_int,))
+        resultado = cursor.fetchone()
+        if resultado:
+            return resultado
+    except ValueError:
+        pass
+    
+    # ESTRATEGIA 3: Si el código tiene 9 dígitos (código de báscula 9 dígitos),
+    # buscar en tabla de mapeo
+    if len(codigo_str) == 9 and codigo_str.isdigit():
+        cursor.execute("""
+            SELECT p.* FROM productos p
+            JOIN bascula_mapeo bm ON p.codigo = bm.producto_codigo
+            WHERE bm.codigo_bascula = ?
+        """, (codigo_str,))
+        resultado = cursor.fetchone()
+        if resultado:
+            return resultado
+        
+        # Si no existe mapeo, intentar extracción de PLU
+        ultimos_5 = codigo_str[-5:]
+        ultimos_6 = codigo_str[-6:]
+        ultimos_7 = codigo_str[-7:]
+        
+        for intento in [ultimos_7, ultimos_6, ultimos_5]:
+            try:
+                plu = int(intento)
+                cursor.execute("SELECT * FROM productos WHERE numero_producto = ?", (plu,))
+                resultado = cursor.fetchone()
+                if resultado:
+                    return resultado
+            except ValueError:
+                pass
+        
+        # Búsqueda LIKE para códigos de báscula
+        cursor.execute("SELECT * FROM productos WHERE codigo LIKE ?", (f"{codigo_str}%",))
+        resultado = cursor.fetchone()
+        if resultado:
+            return resultado
+    
+    # ESTRATEGIA 4: Si el código es largo (barcode), buscar por últimos dígitos
+    if len(codigo_str) > 6:
+        ultimos_6 = codigo_str[-6:]
+        cursor.execute("SELECT * FROM productos WHERE codigo LIKE ?", (f"%{ultimos_6}",))
+        resultado = cursor.fetchone()
+        if resultado:
+            return resultado
+    
+    return None
 
 def obtener_precio_por_tipo(producto, tipo_cliente):
     """Obtiene el precio según el tipo de cliente para productos por unidad"""
@@ -733,20 +859,46 @@ def obtener_creditos_vencidos_con_hora():
     ''', (fecha_hoy, fecha_hoy, hora_actual))
     return cursor.fetchall()
 
-def obtener_alertas_pendientes():
-    """Obtener créditos que necesitan alerta pero no se ha mostrado"""
+def obtener_creditos_vencidos():
+    """Obtener SOLO créditos que ya han vencido (fecha_vencimiento + hora_vencimiento < ahora)"""
     ahora = datetime.now()
     fecha_hoy = ahora.strftime("%Y-%m-%d")
     hora_actual = ahora.strftime("%H:%M")
     
     cursor.execute('''
-        SELECT cliente, monto, fecha_vencimiento, hora_vencimiento, id
+        SELECT cliente, monto, fecha_vencimiento, hora_vencimiento, id, alerta_mostrada
         FROM creditos_pendientes 
-        WHERE ((fecha_vencimiento < ? OR (fecha_vencimiento = ? AND hora_vencimiento <= ?)) 
-               AND pagado = 0 AND alerta_mostrada = 0)
+        WHERE pagado = 0 AND (
+            fecha_vencimiento < ? 
+            OR (fecha_vencimiento = ? AND hora_vencimiento < ?)
+        )
         ORDER BY fecha_vencimiento, hora_vencimiento
     ''', (fecha_hoy, fecha_hoy, hora_actual))
     return cursor.fetchall()
+
+def obtener_creditos_por_vencer():
+    """Obtener créditos que vencen en menos de 1 hora (entre ahora y ahora + 1 hora)"""
+    ahora = datetime.now()
+    fecha_hoy = ahora.strftime("%Y-%m-%d")
+    hora_actual = ahora.strftime("%H:%M")
+    
+    # Sumar 1 hora
+    una_hora_despues = (ahora + timedelta(hours=1)).strftime("%H:%M")
+    
+    cursor.execute('''
+        SELECT cliente, monto, fecha_vencimiento, hora_vencimiento, id, alerta_mostrada
+        FROM creditos_pendientes 
+        WHERE pagado = 0 AND fecha_vencimiento = ? 
+            AND hora_vencimiento > ? AND hora_vencimiento <= ?
+        ORDER BY hora_vencimiento
+    ''', (fecha_hoy, hora_actual, una_hora_despues))
+    return cursor.fetchall()
+
+def obtener_alertas_pendientes():
+    """Obtener créditos que necesitan alerta pero no se ha mostrado (VENCIDOS)"""
+    vencidos = obtener_creditos_vencidos()
+    # Filtrar por alerta_mostrada = 0
+    return [c for c in vencidos if c[5] == 0]  # El índice 5 es alerta_mostrada
 
 def marcar_alerta_mostrada(credito_id):
     """Marcar que la alerta ya fue mostrada"""
@@ -759,32 +911,75 @@ def marcar_credito_pagado(credito_id):
     conn.commit()
 
 def mostrar_popup_alertas_mejorado():
-    """Mostrar popup con alertas críticas y diseño mejorado"""
-    alertas = obtener_alertas_pendientes()
+    """Mostrar alertas emergentes para créditos vencidos Y créditos por vencer en 1 hora"""
     
-    if alertas:
+    # 🔴 ALERTAS DE CRÉDITOS VENCIDOS (MÁXIMA PRIORIDAD)
+    alertas_vencidas = obtener_alertas_pendientes()
+    
+    if alertas_vencidas:
         st.markdown("""
-        <div class="alert-critica">
-            🐄🚨 ¡ALERTA DE CRÉDITOS VENCIDOS! 🚨🐄
+        <div style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%); 
+                    padding: 1.5rem; border-radius: 15px; border-left: 6px solid #c92a2a; 
+                    margin: 1rem 0; box-shadow: 0 4px 15px rgba(255,107,107,0.3);">
+            <h2 style="color: white; margin: 0; font-size: 1.5rem; text-align: center;">
+                🐄🚨 ¡ALERTA CRÍTICA: CRÉDITOS VENCIDOS! 🚨🐄
+            </h2>
         </div>
         """, unsafe_allow_html=True)
         
-        for alerta in alertas:
-            cliente, monto, fecha_venc, hora_venc, credito_id = alerta
+        for alerta in alertas_vencidas:
+            cliente, monto, fecha_venc, hora_venc, credito_id, alerta_mostrada = alerta
             
             col1, col2, col3 = st.columns([3, 1, 1])
             with col1:
-                st.error(f"💰 **{cliente}** debe {formatear_moneda(monto)} desde {fecha_venc} a las {hora_venc}")
+                st.error(f"⏰ **VENCIDO:** {cliente} debe {formatear_moneda(monto)}\n"
+                        f"Desde: {fecha_venc} a las {hora_venc}")
             with col2:
-                if st.button("✅ PAGADO", key=f"pagar_popup_{credito_id}", type="primary"):
+                if st.button("✅ PAGADO", key=f"pagar_vencido_{credito_id}", type="primary"):
                     marcar_credito_pagado(credito_id)
+                    st.balloons()
                     st.success(f"✅ Crédito de {cliente} marcado como pagado")
                     st.rerun()
             with col3:
-                if st.button("⏰ MÁS TARDE", key=f"recordar_{credito_id}"):
+                if st.button("⏰ DESPUÉS", key=f"recordar_vencido_{credito_id}"):
                     marcar_alerta_mostrada(credito_id)
-                    st.info("Se volverá a alertar mañana a las 3 PM")
+                    st.info("Recordatorio desactivado hasta mañana")
                     st.rerun()
+        st.markdown("---")
+    
+    # 🟡 ALERTAS DE CRÉDITOS POR VENCER EN 1 HORA (PRIORIDAD MEDIA)
+    alertas_pronto = obtener_creditos_por_vencer()
+    
+    if alertas_pronto:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #ffd93d 0%, #ffb700 100%); 
+                    padding: 1.5rem; border-radius: 15px; border-left: 6px solid #ff9c00; 
+                    margin: 1rem 0; box-shadow: 0 4px 15px rgba(255,193,7,0.3);">
+            <h2 style="color: #1a1a1a; margin: 0; font-size: 1.5rem; text-align: center;">
+                ⚠️  RECORDATORIO: CRÉDITOS VENCEN EN MENOS DE 1 HORA ⚠️
+            </h2>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        for alerta in alertas_pronto:
+            cliente, monto, fecha_venc, hora_venc, credito_id, alerta_mostrada = alerta
+            
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                st.warning(f"🕐 **POR VENCER:** {cliente} debe {formatear_moneda(monto)}\n"
+                          f"Vence: HOY a las {hora_venc}")
+            with col2:
+                if st.button("✅ PAGADO", key=f"pagar_pronto_{credito_id}", type="primary"):
+                    marcar_credito_pagado(credito_id)
+                    st.balloons()
+                    st.success(f"✅ Crédito de {cliente} marcado como pagado")
+                    st.rerun()
+            with col3:
+                if st.button("📝 OK", key=f"ok_pronto_{credito_id}"):
+                    marcar_alerta_mostrada(credito_id)
+                    st.info("Recordatorio visto")
+                    st.rerun()
+        st.markdown("---")
 
 def mostrar():
     # Aplicar estilos personalizados
@@ -820,6 +1015,10 @@ def mostrar():
                 if (paso1) {
                     paso1.addEventListener('click', enfocarCampoCodigo);
                     doc.addEventListener('click', function(e) {
+                        // No enfocar si se está interactuando con la sección de ventas de hoy
+                        if (e.target.closest('[data-testid="stSelectbox"]')) return;
+                        if (e.target.closest('button')) return;
+                        
                         // Si el click no es en un input, select o button, enfocar el campo de código
                         if (!e.target.matches('input, select, button, textarea, a')) {
                             enfocarCampoCodigo();
@@ -831,7 +1030,10 @@ def mostrar():
             
             // Intentar enfocar cada 100ms durante los primeros 3 segundos
             focusInterval = setInterval(() => {
-                if (enfocarCampoCodigo()) {
+                // No enfocar si hay un selectbox abierto o activo
+                const doc = window.parent.document;
+                const selectActivo = doc.querySelector('[data-testid="stSelectbox"] input:focus');
+                if (!selectActivo && enfocarCampoCodigo()) {
                     agregarClickHandler();
                 }
             }, 100);
@@ -906,12 +1108,32 @@ def mostrar():
         if 'total_venta' in st.session_state:
             del st.session_state['total_venta']
     
-    # Sección de productos - título más compacto con ID para click handler
-    st.markdown("""
-    <div id="paso1-seccion" style="background: linear-gradient(135deg, #83b300 0%, #00a085 100%); padding: .5rem; border-radius: 16px; margin: 0.8rem 0;">
-        <h2 style="color: white; text-align: center; margin-bottom: 0.8rem; font-size: 1.6rem;">📦 PASO 1: AGREGAR PRODUCTOS</h2>
-    </div>
-    """, unsafe_allow_html=True)
+    # Mostrar estado actual del carrito y botón para vaciarlo
+    if 'carrito' not in st.session_state:
+        st.session_state.carrito = []
+    
+    num_items_carrito = len(st.session_state.carrito)
+    
+    col_titulo, col_boton = st.columns([3, 1])
+    with col_titulo:
+        st.markdown(f"""
+        <div id="paso1-seccion" style="background: linear-gradient(135deg, #83b300 0%, #00a085 100%); padding: .5rem; border-radius: 16px; margin: 0.8rem 0;">
+            <h2 style="color: white; text-align: center; margin-bottom: 0.8rem; font-size: 1.6rem;">
+                📦 PASO 1: AGREGAR PRODUCTOS 
+                <span style="background: rgba(255,255,255,0.3); padding: 0.2rem 0.8rem; border-radius: 20px; font-size: 1.2rem;">
+                    🛒 {num_items_carrito}
+                </span>
+            </h2>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col_boton:
+        if num_items_carrito > 0:
+            if st.button("🗑️ Vaciar Carrito", use_container_width=True, type="secondary"):
+                st.session_state.carrito = []
+                st.session_state['ultimo_ticket_procesado'] = ''
+                st.session_state['codigos_ya_agregados_ticket'] = set()
+                st.rerun()
     
     col_codigo, col_cantidad = st.columns([2, 1])
     
@@ -953,14 +1175,71 @@ def mostrar():
         
         codigo = st.text_input(
             "Código de Barras",
-            value="",  # Siempre vacío para nuevos widgets
+            value="",
             placeholder="👉 ESCANEA AQUÍ o ingresa código",
             label_visibility="collapsed",
             key=widget_key,
             help="Campo activo - Escanea directamente aquí"
         )
+        
+        # ACUMULADOR DE TICKETS: Si llega un código de 13 dígitos, acumular
+        # ESTRATEGIA FINAL: Capturar múltiplos de 13 dígitos y procesar con timeout simple
+        if codigo and codigo.isdigit() and len(codigo) >= 13 and len(codigo) % 13 == 0:
+            import time
+            tiempo_actual = time.time()
+            
+            num_productos = len(codigo) // 13
+            print(f"\n🎫 TICKET RECIBIDO: {len(codigo)} dígitos, {num_productos} producto(s)")
+            print(f"   Código: {codigo}")
+            
+            # Obtener estado del buffer
+            buffer_ticket = st.session_state.get('buffer_ticket', '')
+            ultimo_tiempo = st.session_state.get('buffer_ticket_tiempo', 0)
+            intentos_espera = st.session_state.get('buffer_intentos_espera', 0)
+            
+            # Si este código es diferente o más largo que el buffer, actualizarlo
+            if not buffer_ticket or codigo != buffer_ticket:
+                if len(codigo) > len(buffer_ticket):
+                    print(f"   ✅ Actualizando buffer (ticket más completo)")
+                    st.session_state['buffer_ticket'] = codigo
+                    st.session_state['buffer_ticket_tiempo'] = tiempo_actual
+                    st.session_state['buffer_intentos_espera'] = 0
+                    st.info(f"📊 {num_productos} producto(s) detectado(s) - Esperando más bloques...")
+                    codigo = ""
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    print(f"   ℹ️ Buffer ya tiene ticket más completo, ignorando")
+                    codigo = ""
+            else:
+                # El buffer no ha cambiado, incrementar contador de espera
+                intentos_espera += 1
+                st.session_state['buffer_intentos_espera'] = intentos_espera
+                print(f"   ⏳ Buffer sin cambios, intento {intentos_espera}/4")
+                
+                # Después de 4 intentos sin cambios (4 × 0.5s = 2s), procesar
+                if intentos_espera >= 4:
+                    print(f"   ✅ PROCESANDO: {len(buffer_ticket)} dígitos, {len(buffer_ticket)//13} productos")
+                    codigo = buffer_ticket
+                    st.success(f"✅ Procesando {len(codigo)//13} producto(s)")
+                    # Limpiar todo
+                    st.session_state['buffer_ticket'] = ''
+                    st.session_state['buffer_ticket_tiempo'] = 0
+                    st.session_state['buffer_intentos_espera'] = 0
+                else:
+                    # Seguir esperando
+                    st.info(f"📊 {num_productos} producto(s) - Verificando bloques adicionales ({intentos_espera}/4)...")
+                    codigo = ""
+                    time.sleep(0.5)
+                    st.rerun()
+                
+        elif codigo:
+            # No es un código válido de ticket
+            st.session_state['buffer_ticket'] = ''
+            st.session_state['buffer_ticket_tiempo'] = 0
+            st.session_state['buffer_intentos_espera'] = 0
     
-    # INYECTAR AUTOFOCUS DIRECTAMENTE EN EL INPUT
+    # INYECTAR AUTOFOCUS Y DEBOUNCE PARA CAPTURAR ESCÁNER COMPLETO
     components.html(
         """
         <script>
@@ -969,10 +1248,31 @@ def mostrar():
             const input = parentDoc.querySelector('input[aria-label="Código de Barras"]') || 
                          parentDoc.querySelector('input[placeholder*="ESCANEA"]');
             
-            if (input) {
+            if (input && !input.hasAttribute('data-scanner-ready')) {
                 input.setAttribute('autofocus', 'autofocus');
+                input.setAttribute('data-scanner-ready', 'true');
                 input.focus();
                 input.click();
+                
+                // Deshabilitar el auto-submit de Streamlit temporalmente
+                // para que el escáner pueda enviar todos los dígitos
+                let typingTimer;
+                const doneTypingInterval = 200; // 200ms después de la última tecla
+                
+                input.addEventListener('input', function(e) {
+                    clearTimeout(typingTimer);
+                    typingTimer = setTimeout(() => {
+                        // Después de 200ms sin input, enviar el formulario
+                        const enterEvent = new KeyboardEvent('keydown', {
+                            key: 'Enter',
+                            code: 'Enter',
+                            keyCode: 13,
+                            bubbles: true
+                        });
+                        input.dispatchEvent(enterEvent);
+                    }, doneTypingInterval);
+                });
+                
                 clearInterval(interval);
             }
         }, 50);
@@ -986,45 +1286,73 @@ def mostrar():
     
     # DETECCIÓN DE TICKETS
     es_ticket = False
+    productos_ticket = []
+    
     if codigo and len(codigo) >= 13 and len(codigo) % 13 == 0:
         es_ticket = True
         productos_ticket = parsear_codigo_bascula(codigo)
         
-        # Solución simple: ignorar si es exactamente 13 dígitos y ya hay algo en session_state esperando más
-        # El escáner envía datos incrementalmente, así que si detectamos 13 dígitos, podría ser parcial
-        if len(codigo) == 13:
-            # Guardar y esperar a ver si llegan más dígitos
-            if 'esperando_ticket_completo' not in st.session_state:
-                st.session_state['esperando_ticket_completo'] = codigo
-                st.info("⏳ Escaneando ticket...")
-                productos_ticket = []  # No procesar aún
-            elif st.session_state['esperando_ticket_completo'] != codigo:
-                # Diferente código, resetear
-                st.session_state['esperando_ticket_completo'] = codigo
-                productos_ticket = []
-        else:
-            # Más de 13 dígitos, es el ticket completo o múltiples productos
-            st.session_state.pop('esperando_ticket_completo', None)
+        # Los escáneres modernos envían todos los datos de una vez
+        # Procesar inmediatamente sin esperas
         
         if productos_ticket:
+            num_productos = len(productos_ticket)
+            emoji_cantidad = "📦" if num_productos <= 5 else "📦📦" if num_productos <= 10 else "📦📦📦"
+            mensaje_cantidad = f"{num_productos} producto{'s' if num_productos != 1 else ''}"
+            
             st.markdown(f"""
             <div style="background: linear-gradient(135deg, #6c5ce7 0%, #a29bfe 100%); padding: 1.5rem; border-radius: 15px; margin: 1rem 0; color: white; text-align: center;">
                 <div style="font-size: 1.6rem; font-weight: bold;">🎫 TICKET DETECTADO</div>
-                <div style="font-size: 1.2rem; margin-top: 0.5rem;">📦 {len(productos_ticket)} producto(s)</div>
+                <div style="font-size: 1.2rem; margin-top: 0.5rem;">{emoji_cantidad} {mensaje_cantidad}</div>
+                <div style="font-size: 0.9rem; margin-top: 0.3rem; opacity: 0.9;">{len(codigo)} dígitos escaneados</div>
             </div>
             """, unsafe_allow_html=True)
             
-            # Procesar automáticamente solo UNA VEZ
-            ultimo = st.session_state.get('ultimo_ticket_procesado')
+            # Procesar automáticamente solo UNA VEZ - VALIDACIÓN ESTRICTA
+            ultimo = st.session_state.get('ultimo_ticket_procesado', '')
             print(f"DEBUG: Verificando ticket - ultimo={ultimo}, codigo={codigo}, son iguales={ultimo==codigo}")
-            if ultimo != codigo:
+            
+            # IMPORTANTE: Validar si este ticket ya fue procesado O es sub-ticket de uno ya procesado
+            # Caso 1: Ticket idéntico
+            ticket_ya_procesado = (ultimo == codigo)
+            
+            # Caso 2: Ticket actual es parte de uno ya procesado (ticket parcial repetido)
+            if not ticket_ya_procesado and ultimo and len(ultimo) > len(codigo):
+                ticket_ya_procesado = ultimo.startswith(codigo)
+                if ticket_ya_procesado:
+                    print(f"⚠️ TICKET PARCIAL DETECTADO - Este ticket es parte de uno ya procesado")
+            
+            # Caso 3: Ticket actual CONTIENE uno ya procesado (ticket completo después de uno parcial)
+            if not ticket_ya_procesado and ultimo and len(codigo) > len(ultimo):
+                ticket_ya_procesado = codigo.startswith(ultimo)
+                if ticket_ya_procesado:
+                    print(f"⚠️ TICKET EXTENDIDO DETECTADO - Ya procesamos la versión parcial de este ticket")
+            
+            if ticket_ya_procesado:
+                print(f"⚠️ TICKET YA PROCESADO - Saltando completamente")
+                st.info("✅ Ticket ya procesado anteriormente")
+                # Limpiar el campo y no hacer nada más
+                st.session_state['limpiar_codigo'] = True
+                codigo = ""  # Limpiar para evitar re-procesar
+                # NO HACER st.rerun() aquí para evitar loops infinitos
+            else:
                 print(f"✨ ENTRANDO AL BLOQUE DE PROCESAMIENTO - Primera vez para este ticket")
-                # Marcar como procesado INMEDIATAMENTE para evitar re-procesamiento
+                # Marcar como procesado INMEDIATAMENTE ANTES de hacer cualquier cosa
                 st.session_state['ultimo_ticket_procesado'] = codigo
                 
                 # Asegurar que el carrito existe
                 if 'carrito' not in st.session_state:
                     st.session_state.carrito = []
+
+                # IMPORTANTE: Contar productos en carrito ANTES de procesar
+                productos_antes = len(st.session_state.carrito)
+                print(f"📊 CARRITO ANTES DE PROCESAR: {productos_antes} productos")
+                
+                # DEBUG: Mostrar QUÉ productos hay en el carrito
+                if productos_antes > 0:
+                    print(f"🔍 PRODUCTOS EN CARRITO ANTES DE PROCESAR:")
+                    for i, item in enumerate(st.session_state.carrito, 1):
+                        print(f"   {i}. {item.get('nombre', 'SIN NOMBRE')} - Código: {item.get('codigo', 'N/A')}")
 
                 # Debug: guardar códigos parseados en session_state para verlos después
                 st.session_state['debug_ticket'] = [(c, v) for c, v in productos_ticket]
@@ -1032,30 +1360,35 @@ def mostrar():
                 agregados = 0
                 no_encontrados = []
                 
-                # Inicializar set de duplicados solo si es un ticket nuevo
-                if 'codigos_ya_agregados_ticket' not in st.session_state:
-                    st.session_state['codigos_ya_agregados_ticket'] = set()
-                    st.session_state['ultimo_ticket_id'] = codigo
-                elif st.session_state.get('ultimo_ticket_id') != codigo:
-                    # Nuevo ticket diferente, resetear el set
-                    st.session_state['codigos_ya_agregados_ticket'] = set()
-                    st.session_state['ultimo_ticket_id'] = codigo
-                
+                # Limpiar set de duplicados para este nuevo ticket
+                st.session_state['codigos_ya_agregados_ticket'] = set()
                 codigos_ya_agregados = st.session_state['codigos_ya_agregados_ticket']
 
-                for codigo_prod, valor in productos_ticket:
+                print(f"\n{'='*60}")
+                print(f"INICIANDO PROCESAMIENTO DE {len(productos_ticket)} PRODUCTOS")
+                print(f"{'='*60}")
+                
+                for idx, (codigo_prod, valor) in enumerate(productos_ticket, 1):
+                    print(f"\n{'─'*60}")
+                    print(f"PROCESANDO PRODUCTO {idx} DE {len(productos_ticket)}")
+                    print(f"{'─'*60}")
                     # Intentar buscar con código de diferentes longitudes
                     prod = None
                     codigo_real_encontrado = None
                     
+                    print(f"\n🔍 Buscando producto con código: {codigo_prod}, valor: {valor}")
+                    
                     for longitud in [9, 8, 7, 6, 5]:
                         codigo_intento = codigo_prod[:longitud]
+                        print(f"  Intentando con longitud {longitud}: {codigo_intento}")
                         prod = obtener_producto_por_codigo(codigo_intento)
                         if prod:
                             info = obtener_informacion_producto(prod)
                             codigo_real_encontrado = info['codigo']
-                            print(f"Encontrado producto: {info['nombre']} con código real: {codigo_real_encontrado}")
+                            print(f"  ✅ Encontrado: {info['nombre']} (tipo: {info['tipo_venta']}, stock_kg: {info['stock_kg']})")
                             break
+                        else:
+                            print(f"  ❌ No encontrado con longitud {longitud}")
                     
                     # Verificar si ya agregamos este producto (por código real)
                     if codigo_real_encontrado and codigo_real_encontrado in codigos_ya_agregados:
@@ -1065,12 +1398,20 @@ def mostrar():
                     if prod:
                         # Marcar como agregado ANTES de procesarlo
                         codigos_ya_agregados.add(codigo_real_encontrado)
-                        print(f"✓ Agregando al carrito: {info['nombre']} - Set actual: {codigos_ya_agregados}")
+                        print(f"✓ Procesando: {info['nombre']} (tipo: {info['tipo_venta']})")
 
-                        if info['tipo_venta'] == 'granel':
+                        if info['tipo_venta'] in ['granel', 'kg']:
                             peso_kg = valor / 1000.0
+                            print(f"  📦 Producto a granel: {peso_kg:.3f} kg")
                             precio_kg = obtener_precio_granel_por_tipo(prod, "Normal")
+                            print(f"  💰 Precio por kg: ${precio_kg}")
                             total = precio_kg * peso_kg
+                            print(f"  💵 Total: ${total:.2f}")
+                            print(f"  📊 Stock disponible: {info['stock_kg']:.3f} kg")
+                            if info['stock_kg'] >= peso_kg:
+                                print(f"  ✅ HAY STOCK - Agregando al carrito")
+                            else:
+                                print(f"  ❌ SIN STOCK SUFICIENTE ({info['stock_kg']:.3f} < {peso_kg:.3f})")
                             if info['stock_kg'] >= peso_kg:
                                 item = {
                                     'codigo': info['codigo'],
@@ -1079,11 +1420,13 @@ def mostrar():
                                     'peso': peso_kg,
                                     'precio_unitario': precio_kg,
                                     'total': total,
-                                    'tipo_venta': 'granel'
+                                    'tipo_venta': info['tipo_venta']
                                 }
                                 st.session_state.carrito.append(item)
+                                print(f"  🛒 AGREGADO AL CARRITO")
                                 agregados += 1
                         else:
+                            print(f"  📦 Producto por unidad")
                             # Calcular cantidad
                             cant = valor // 100
                             if valor % 1000 == 0 and (valor // 1000) > 0:
@@ -1104,19 +1447,38 @@ def mostrar():
                                     'tipo_venta': 'unidad'
                                 }
                                 st.session_state.carrito.append(item)
+                                print(f"  🛒 AGREGADO AL CARRITO")
                                 agregados += 1
                     else:
+                        print(f"  ❌ PRODUCTO NO ENCONTRADO: {codigo_prod}")
                         no_encontrados.append(codigo_prod)
+                
+                print(f"\n{'='*60}")
+                print(f"FIN DEL LOOP - Procesados {len(productos_ticket)} productos")
+                print(f"Agregados al carrito: {agregados}")
+                print(f"No encontrados: {len(no_encontrados)}")
+                
+                # VERIFICAR: ¿Cuántos productos hay ahora en el carrito?
+                productos_despues = len(st.session_state.carrito)
+                print(f"📊 CARRITO DESPUÉS DE PROCESAR: {productos_despues} productos")
+                print(f"📊 DIFERENCIA: {productos_despues - productos_antes} productos agregados")
+                
+                # DEBUG: Mostrar TODOS los productos finales
+                print(f"🔍 PRODUCTOS FINALES EN CARRITO:")
+                for i, item in enumerate(st.session_state.carrito, 1):
+                    print(f"   {i}. {item.get('nombre', 'SIN NOMBRE')} - Código: {item.get('codigo', 'N/A')}")
+                print(f"{'='*60}\n")
 
-                # Limpiar el código de entrada completamente
-                st.session_state['limpiar_codigo'] = True
-
+                # Mostrar resultados del procesamiento con más detalle
                 if agregados > 0:
-                    st.success(f"✅ {agregados} productos agregados automáticamente")
-                    # Hacer rerun para limpiar el campo visualmente
-                    st.rerun()
+                    st.success(f"✅ {agregados} producto(s) agregado(s) → Total en carrito: {productos_despues} productos")
                 if no_encontrados:
                     st.warning(f"⚠️ No encontrados: {', '.join(no_encontrados)}")
+                
+                # Limpiar el código de entrada completamente AL FINAL
+                st.session_state['limpiar_codigo'] = True
+                # Hacer rerun para limpiar el campo visualmente DESPUÉS de procesar todo
+                st.rerun()
     
     # Verificar si el producto existe y obtener información (SOLO si NO es ticket)
     # Si es un ticket, NO mostrar ningún mensaje de producto individual
@@ -1208,7 +1570,7 @@ def mostrar():
     
     with col_cantidad:
         if info_producto:
-            if info_producto.get('tipo_venta') == 'granel':
+            if info_producto.get('tipo_venta') in ['granel', 'kg']:
                 st.markdown("#### ⚖️ Peso (Kg)")
                 peso = st.number_input(
                     "Peso en Kilogramos",
@@ -1314,7 +1676,7 @@ def mostrar():
     with col_btn_agregar[1]:
         if st.button("🛒 AGREGAR AL CARRITO", type="primary"):
             if info_producto:
-                if info_producto['tipo_venta'] == 'granel':
+                if info_producto['tipo_venta'] in ['granel', 'kg']:
                     if info_producto['stock_kg'] >= peso:
                         precio_kg = obtener_precio_granel_por_tipo(producto_info, cliente_tipo_inicial)
                         total = precio_kg * peso
@@ -1405,13 +1767,12 @@ def mostrar():
     if st.session_state.carrito:
         st.markdown("---")
         
-        # Mostrar debug de ticket si existe
-        if 'debug_ticket' in st.session_state and st.session_state.debug_ticket:
-            st.info(f"🔍 DEBUG - Códigos parseados del último ticket: {st.session_state.debug_ticket}")
+        # Ocultar debug de ticket en producción
+        # (Si se requiere, habilitar bajo un flag de desarrollo)
         
         st.markdown("""        
-        <div style="background: linear-gradient(135deg, #a8d5ba 0%, #90c695 100%); padding: 1.5rem; border-radius: 16px; margin: 0.8rem 0; border: 2px solid #7eb693;">
-            <h2 style="color: #1e3a28; text-align: center; margin-bottom: 0.8rem; font-size: 1.6rem;">🛒 CARRITO DE COMPRAS</h2>
+        <div style="background: linear-gradient(135deg, #a8d5ba 0%, #90c695 100%); padding: 0.6rem; border-radius: 12px; margin: 0.6rem 0; border: 1px solid #7eb693;">
+            <h2 style="color: #1e3a28; text-align: center; margin: 0; font-size: 1.3rem;">🛒 CARRITO DE COMPRAS</h2>
         </div>
         """, unsafe_allow_html=True)
         
@@ -1441,7 +1802,7 @@ def mostrar():
         # Mostrar items del carrito con diseño mejorado y organizado
         for i, item in enumerate(st.session_state.carrito):
             # Determinar el tipo de medida y formato
-            if item['tipo_venta'] == 'granel':
+            if item['tipo_venta'] in ['granel', 'kg']:
                 icono_producto = "⚖️"
                 cantidad_formato = f"{item['peso']:.3f} Kg"
                 precio_unitario_label = f"{formatear_moneda(item['precio_unitario'])}/Kg"
@@ -1482,9 +1843,11 @@ def mostrar():
                     st.rerun()
             
             with col_acciones[2]:
-                if st.button("✏️", key=f"editar_{i}", help="Editar cantidad/peso", type="secondary"):
-                    st.session_state[f'editando_{i}'] = True
-                    st.rerun()
+                # Solo permitir edición para productos por unidad (no granel)
+                if item['tipo_venta'] not in ['granel', 'kg']:
+                    if st.button("✏️", key=f"editar_{i}", help="Editar cantidad", type="secondary"):
+                        st.session_state[f'editando_{i}'] = True
+                        st.rerun()
             
             # Sistema de edición mejorado
             if st.session_state.get(f'editando_{i}', False):
@@ -1494,14 +1857,37 @@ def mostrar():
                 </div>
                 """, unsafe_allow_html=True)
                 
+                # Obtener stock actual del producto
+                producto_actual = obtener_producto_por_codigo(item['codigo'])
+                stock_disponible = 0
+                stock_kg_disponible = 0.0
+                tiene_stock_suficiente = True
+                
+                if producto_actual:
+                    info_prod = obtener_informacion_producto(producto_actual)
+                    stock_disponible = info_prod['stock']
+                    stock_kg_disponible = info_prod['stock_kg']
+                
                 col_edit1, col_edit2, col_edit3, col_edit4 = st.columns([2, 1, 1, 1])
                 
                 with col_edit1:
                     st.info(f"**Producto:** {item['nombre']}")
                     st.info(f"**Código:** {item['codigo']}")
+                    
+                    # Mostrar stock disponible según tipo de venta (soporta 'granel' o 'kg')
+                    if item['tipo_venta'] in ['granel', 'kg']:
+                        if stock_kg_disponible > 0:
+                            st.success(f"📦 **Stock disponible:** {stock_kg_disponible:.3f} Kg")
+                        else:
+                            st.error(f"⚠️ **Stock disponible:** {stock_kg_disponible:.3f} Kg")
+                    else:
+                        if stock_disponible > 0:
+                            st.success(f"📦 **Stock disponible:** {stock_disponible} unidades")
+                        else:
+                            st.error(f"⚠️ **Stock disponible:** {stock_disponible} unidades")
                 
                 with col_edit2:
-                    if item['tipo_venta'] == 'granel':
+                    if item['tipo_venta'] in ['granel', 'kg']:
                         nuevo_peso = st.number_input(
                             "**Nuevo peso (Kg):**", 
                             min_value=0.050, 
@@ -1510,6 +1896,10 @@ def mostrar():
                             format="%.3f",
                             key=f"edit_peso_{i}"
                         )
+                        # Validar stock
+                        if nuevo_peso > stock_kg_disponible:
+                            tiene_stock_suficiente = False
+                            st.error(f"⚠️ Excede stock: {stock_kg_disponible:.3f} Kg")
                     else:
                         nueva_cantidad = st.number_input(
                             "**Nueva cantidad:**", 
@@ -1518,10 +1908,14 @@ def mostrar():
                             step=1,
                             key=f"edit_cantidad_{i}"
                         )
+                        # Validar stock
+                        if nueva_cantidad > stock_disponible:
+                            tiene_stock_suficiente = False
+                            st.error(f"⚠️ Excede stock: {stock_disponible} unid.")
                 
                 with col_edit3:
                     st.markdown("**Precio unitario:**")
-                    if item['tipo_venta'] == 'granel':
+                    if item['tipo_venta'] in ['granel', 'kg']:
                         st.info(f"{formatear_moneda(item['precio_unitario'])}/Kg")
                         nuevo_total = item['precio_unitario'] * nuevo_peso
                         st.success(f"**Nuevo total:** {formatear_moneda(nuevo_total)}")
@@ -1533,8 +1927,9 @@ def mostrar():
                 with col_edit4:
                     col_btn_edit = st.columns(2)
                     with col_btn_edit[0]:
-                        if st.button("✅ Guardar", key=f"guardar_{i}", type="primary"):
-                            if item['tipo_venta'] == 'granel':
+                        # Deshabilitar botón si no hay stock suficiente
+                        if st.button("✅ Guardar", key=f"guardar_{i}", type="primary", disabled=not tiene_stock_suficiente):
+                            if item['tipo_venta'] in ['granel', 'kg']:
                                 st.session_state.carrito[i]['peso'] = nuevo_peso
                                 st.session_state.carrito[i]['total'] = item['precio_unitario'] * nuevo_peso
                             else:
@@ -1550,12 +1945,16 @@ def mostrar():
                             del st.session_state[f'editando_{i}']
                             st.rerun()
                 
+                # Mensaje adicional si no hay stock suficiente
+                if not tiene_stock_suficiente:
+                    st.warning("⚠️ **No puedes guardar:** La cantidad solicitada excede el stock disponible.")
+                
                 st.markdown("---")
         
         # Resumen del carrito con mejor diseño
         st.markdown("""
-        <div style="background: linear-gradient(135deg, #2d3436 0%, #636e72 100%); padding: 1rem; border-radius: 10px; margin: 1rem 0; color: white;">
-            <h3 style="text-align: center; margin-bottom: 1rem; color: #ddd;">📊 RESUMEN DEL CARRITO</h3>
+        <div style="background: linear-gradient(135deg, #2d3436 0%, #636e72 100%); padding: 0.6rem; border-radius: 10px; margin: 0.8rem 0; color: white;">
+            <h3 style="text-align: center; margin: 0; color: #ddd; font-size: 1.1rem;">📊 RESUMEN DEL CARRITO</h3>
         </div>
         """, unsafe_allow_html=True)
         
@@ -1564,7 +1963,7 @@ def mostrar():
         
         # Mostrar total destacado
         st.markdown(f"""
-        <div class="total-destacado">
+        <div class="total-destacado" style="padding: 0.5rem; font-size: 1.1rem;">
             💰 TOTAL GENERAL: {formatear_moneda(total_general)}
         </div>
         """, unsafe_allow_html=True)
@@ -1578,8 +1977,8 @@ def mostrar():
             mostrar_metrica_mejorada(f"Por Unidad\n{total_unidades} items", productos_unidad, "🏷️", False)
         
         with col_metricas[1]:
-            productos_granel = len([item for item in st.session_state.carrito if item['tipo_venta'] == 'granel'])
-            peso_total = sum([item['peso'] for item in st.session_state.carrito if item['tipo_venta'] == 'granel'])
+            productos_granel = len([item for item in st.session_state.carrito if item['tipo_venta'] in ['granel', 'kg']])
+            peso_total = sum([item['peso'] for item in st.session_state.carrito if item['tipo_venta'] in ['granel', 'kg']])
             mostrar_metrica_mejorada(f"A Granel\n{peso_total:.3f} Kg", productos_granel, "⚖️", False)
         
         with col_metricas[2]:
@@ -2090,6 +2489,9 @@ def mostrar():
                         for key in keys_to_remove:
                             del st.session_state[key]
                         
+                        # Resetear método de pago a Efectivo para la siguiente venta
+                        st.session_state.tipo_pago_unico_selected = 'Efectivo'
+                        
                         # Marcar que se debe limpiar el código para nueva venta
                         st.session_state['limpiar_codigo'] = True
                         st.session_state['venta_finalizada'] = True
@@ -2359,6 +2761,440 @@ def mostrar():
         
         </script>
         """, unsafe_allow_html=True)
+
+    # --- SECCIÓN: VENTAS DE HOY CON DETALLE COMPLETO ---
+    st.markdown("---")
+    st.subheader("📋 Ventas de Hoy - Detalle por Venta")
+    st.write("💡 **Tip:** Los montos deben sumar exactamente el total de la venta para poder actualizar.")
+
+    fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+    
+    try:
+        # Obtener todas las ventas de hoy con información completa
+        query_hoy = """
+            SELECT 
+                id, fecha, codigo, nombre, cantidad, precio_unitario, total,
+                tipo_cliente, tipos_pago,
+                monto_efectivo, monto_tarjeta, monto_transferencia, monto_credito,
+                cliente_credito
+            FROM ventas 
+            WHERE DATE(fecha) = ?
+            ORDER BY fecha DESC
+        """
+        
+        ventas_hoy_df = pd.read_sql_query(query_hoy, conn, params=(fecha_hoy,))
+        
+        if ventas_hoy_df.empty:
+            st.info("ℹ️ No hay ventas registradas hoy.")
+        else:
+            # Agrupar ventas por fecha (ticket)
+            grouped = list(ventas_hoy_df.groupby('fecha', sort=False))
+            
+            for idx, (fecha_ticket, group) in enumerate(grouped):
+                # Usar el menor id del grupo como identificador
+                min_id = int(group['id'].min())
+                
+                # Resumen del ticket
+                nombres = group['nombre'].tolist()
+                if len(nombres) == 1:
+                    display_name = nombres[0]
+                else:
+                    display_name = f"{nombres[0]} (+{len(nombres)-1} más)"
+                
+                total_ticket = float(group['total'].sum())
+                tipos_pago = group.iloc[0].get('tipos_pago', 'N/A')
+                
+                # Keys para widgets
+                ef_key = f"ef_hoy_{min_id}"
+                tar_key = f"tar_hoy_{min_id}"
+                trans_key = f"trans_hoy_{min_id}"
+                cred_key = f"cred_hoy_{min_id}"
+                
+                pending_auto = f"pending_auto_hoy_{min_id}"
+                pending_reset = f"pending_reset_hoy_{min_id}"
+                pending_restore = f"pending_restore_hoy_{min_id}"
+                
+                # Aplicar acciones pendientes
+                if pending_auto in st.session_state:
+                    st.session_state[ef_key] = st.session_state.pop(pending_auto)
+                
+                if pending_reset in st.session_state:
+                    vals = st.session_state.pop(pending_reset)
+                    st.session_state[ef_key] = vals[0]
+                    st.session_state[tar_key] = vals[1]
+                    st.session_state[trans_key] = vals[2]
+                    st.session_state[cred_key] = vals[3]
+                
+                if pending_restore in st.session_state:
+                    st.session_state.pop(pending_restore)
+                    st.session_state[ef_key] = round(float(group['monto_efectivo'].fillna(0).sum()), 2)
+                    st.session_state[tar_key] = round(float(group['monto_tarjeta'].fillna(0).sum()), 2)
+                    st.session_state[trans_key] = round(float(group['monto_transferencia'].fillna(0).sum()), 2)
+                    st.session_state[cred_key] = round(float(group['monto_credito'].fillna(0).sum()), 2)
+                
+                # Clamp valores al total del ticket
+                total_venta = round(total_ticket, 2)
+                for k in (ef_key, tar_key, trans_key, cred_key):
+                    if k in st.session_state:
+                        try:
+                            val = float(st.session_state.get(k, 0.0))
+                        except Exception:
+                            val = 0.0
+                        if val > total_venta:
+                            st.session_state[k] = total_venta
+                        elif val < 0:
+                            st.session_state[k] = 0.0
+                
+                with st.expander(f"🛒 Venta #{min_id} - {display_name} - ${total_ticket:.2f} ({tipos_pago})"):
+                    col_info, col_edit = st.columns([2, 1])
+                    
+                    with col_info:
+                        st.write(f"**📅 Fecha:** {pd.to_datetime(fecha_ticket).strftime('%d/%m/%Y %H:%M')}")
+                        
+                        # Detallar los ítems del ticket
+                        for _, row in group.iterrows():
+                            st.write(f"**📦 Producto:** {row['codigo']} - {row['nombre']}")
+                            st.write(f"**📊 Cantidad:** {row['cantidad']} × ${row['precio_unitario']:.2f} = ${row['total']:.2f}")
+                        
+                        st.write(f"**👤 Cliente:** {group.iloc[0].get('tipo_cliente', 'N/A')}")
+                        
+                        if group.iloc[0].get('cliente_credito') and str(group.iloc[0]['cliente_credito']).strip():
+                            st.write(f"**📋 Cliente Crédito:** {group.iloc[0]['cliente_credito']}")
+                        
+                        # Mostrar distribución actual
+                        st.write("**💳 Distribución actual:**")
+                        distribuciones = []
+                        efectivo_sum = float(group['monto_efectivo'].fillna(0).sum())
+                        tarjeta_sum = float(group['monto_tarjeta'].fillna(0).sum())
+                        transferencia_sum = float(group['monto_transferencia'].fillna(0).sum())
+                        credito_sum = float(group['monto_credito'].fillna(0).sum())
+                        
+                        if efectivo_sum > 0:
+                            distribuciones.append(f"  • Efectivo: ${efectivo_sum:.2f}")
+                        if tarjeta_sum > 0:
+                            distribuciones.append(f"  • Tarjeta: ${tarjeta_sum:.2f}")
+                        if transferencia_sum > 0:
+                            distribuciones.append(f"  • Transferencia: ${transferencia_sum:.2f}")
+                        if credito_sum > 0:
+                            distribuciones.append(f"  • Crédito: ${credito_sum:.2f}")
+                        
+                        if distribuciones:
+                            for dist in distribuciones:
+                                st.write(dist)
+                        else:
+                            st.write("  • No hay distribución registrada")
+                    
+                    with col_edit:
+                        st.write("**🔧 Nuevo Método de Pago:**")
+                        st.write(f"**Total a distribuir: ${total_venta:.2f}**")
+                        
+                        # Inicializar valores
+                        monto_efectivo_inicial = min(round(efectivo_sum, 2), total_venta)
+                        monto_tarjeta_inicial = min(round(tarjeta_sum, 2), total_venta)
+                        monto_transferencia_inicial = min(round(transferencia_sum, 2), total_venta)
+                        monto_credito_inicial = min(round(credito_sum, 2), total_venta)
+                        
+                        suma_inicial = monto_efectivo_inicial + monto_tarjeta_inicial + monto_transferencia_inicial + monto_credito_inicial
+                        if abs(suma_inicial - total_venta) > 0.01:
+                            monto_efectivo_inicial = total_venta
+                            monto_tarjeta_inicial = 0.0
+                            monto_transferencia_inicial = 0.0
+                            monto_credito_inicial = 0.0
+                        
+                        st.session_state.setdefault(ef_key, round(monto_efectivo_inicial, 2))
+                        st.session_state.setdefault(tar_key, round(monto_tarjeta_inicial, 2))
+                        st.session_state.setdefault(trans_key, round(monto_transferencia_inicial, 2))
+                        st.session_state.setdefault(cred_key, round(monto_credito_inicial, 2))
+                        
+                        # Inputs para nuevos montos
+                        col_input1, col_input2 = st.columns(2)
+                        
+                        with col_input1:
+                            nuevo_efectivo = st.number_input(
+                                "💵 Efectivo:", 
+                                min_value=0.0, 
+                                max_value=total_venta,
+                                step=0.01, 
+                                key=ef_key,
+                                help=f"Máximo: ${total_venta:.2f}"
+                            )
+                            
+                            nuevo_transferencia = st.number_input(
+                                "📱 Transferencia:", 
+                                min_value=0.0, 
+                                max_value=total_venta,
+                                step=0.01, 
+                                key=trans_key,
+                                help=f"Máximo: ${total_venta:.2f}"
+                            )
+                        
+                        with col_input2:
+                            nuevo_tarjeta = st.number_input(
+                                "💳 Tarjeta:", 
+                                min_value=0.0, 
+                                max_value=total_venta,
+                                step=0.01, 
+                                key=tar_key,
+                                help=f"Máximo: ${total_venta:.2f}"
+                            )
+                            
+                            nuevo_credito = st.number_input(
+                                "📋 Crédito:", 
+                                min_value=0.0, 
+                                max_value=total_venta,
+                                step=0.01, 
+                                key=cred_key,
+                                help=f"Máximo: ${total_venta:.2f}"
+                            )
+                        
+                        # Validar suma
+                        suma_nueva = nuevo_efectivo + nuevo_tarjeta + nuevo_transferencia + nuevo_credito
+                        diferencia = abs(suma_nueva - total_venta)
+                        
+                        col_val1, col_val2 = st.columns(2)
+                        
+                        with col_val1:
+                            st.write(f"**💰 Total venta:** ${total_venta:.2f}")
+                            st.write(f"**🧮 Suma actual:** ${suma_nueva:.2f}")
+                        
+                        with col_val2:
+                            if diferencia > 0.01:
+                                st.error(f"⚠️ **Diferencia:** ${diferencia:.2f}")
+                                st.error("❌ **Los montos deben sumar exactamente el total**")
+                            else:
+                                st.success("✅ **Suma correcta**")
+                        
+                        # Botones de auto-ajuste
+                        if diferencia > 0.01:
+                            col_auto1, col_auto2 = st.columns(2)
+                            
+                            with col_auto1:
+                                if st.button(
+                                    "🔧 Auto-ajustar al Efectivo", 
+                                    key=f"auto_efectivo_hoy_{min_id}",
+                                    help="Asignar toda la diferencia al efectivo"
+                                ):
+                                    diferencia_restante = total_venta - (nuevo_tarjeta + nuevo_transferencia + nuevo_credito)
+                                    if diferencia_restante >= 0:
+                                        st.session_state[pending_auto] = round(diferencia_restante, 2)
+                                        st.info(f"💡 Ajustando efectivo a ${diferencia_restante:.2f}")
+                                        st.rerun()
+                            
+                            with col_auto2:
+                                if st.button(
+                                    "🔄 Resetear a 100% Efectivo", 
+                                    key=f"reset_efectivo_hoy_{min_id}",
+                                    help="Poner todo el monto en efectivo"
+                                ):
+                                    st.session_state[pending_reset] = (round(total_venta, 2), 0.0, 0.0, 0.0)
+                                    st.info("💡 Configurando 100% efectivo")
+                                    st.rerun()
+                        
+                        # Botones principales
+                        st.divider()
+                        col_btn1, col_btn2 = st.columns(2)
+                        
+                        with col_btn1:
+                            button_disabled = diferencia > 0.01
+                            button_type = "primary" if not button_disabled else "secondary"
+                            button_text = "💾 Actualizar" if not button_disabled else "❌ Corrige la suma"
+                            
+                            if st.button(
+                                button_text,
+                                key=f"update_hoy_{min_id}",
+                                disabled=button_disabled,
+                                type=button_type,
+                            ):
+                                # Construir nuevo string de tipos de pago
+                                nuevos_tipos = []
+                                if nuevo_efectivo > 0:
+                                    nuevos_tipos.append("Efectivo")
+                                if nuevo_tarjeta > 0:
+                                    nuevos_tipos.append("Tarjeta")
+                                if nuevo_transferencia > 0:
+                                    nuevos_tipos.append("Transferencia")
+                                if nuevo_credito > 0:
+                                    nuevos_tipos.append("Crédito")
+                                
+                                nuevo_tipos_pago = ", ".join(nuevos_tipos) if nuevos_tipos else "Sin especificar"
+                                
+                                try:
+                                    cursor.execute("""
+                                        UPDATE ventas 
+                                        SET monto_efectivo = ?, 
+                                            monto_tarjeta = ?, 
+                                            monto_transferencia = ?, 
+                                            monto_credito = ?,
+                                            tipos_pago = ?
+                                        WHERE fecha = ?
+                                    """, (nuevo_efectivo, nuevo_tarjeta, nuevo_transferencia, nuevo_credito, nuevo_tipos_pago, fecha_ticket))
+                                    
+                                    conn.commit()
+                                    
+                                    st.success(f"✅ Venta #{min_id} actualizada correctamente")
+                                    
+                                    with st.container():
+                                        st.info("**🔄 Cambios aplicados:**")
+                                        col_cambio1, col_cambio2 = st.columns(2)
+                                        
+                                        with col_cambio1:
+                                            if nuevo_efectivo > 0:
+                                                st.write(f"💵 Efectivo: ${nuevo_efectivo:.2f}")
+                                            if nuevo_tarjeta > 0:
+                                                st.write(f"💳 Tarjeta: ${nuevo_tarjeta:.2f}")
+                                        
+                                        with col_cambio2:
+                                            if nuevo_transferencia > 0:
+                                                st.write(f"📱 Transferencia: ${nuevo_transferencia:.2f}")
+                                            if nuevo_credito > 0:
+                                                st.write(f"📋 Crédito: ${nuevo_credito:.2f}")
+                                        
+                                        st.write(f"**💳 Tipo de pago actualizado:** {nuevo_tipos_pago}")
+                                    
+                                    import time
+                                    time.sleep(2)
+                                    st.rerun()
+                                
+                                except Exception as e:
+                                    st.error(f"❌ Error al actualizar: {str(e)}")
+                                    conn.rollback()
+                        
+                        with col_btn2:
+                            if st.button(
+                                f"🔄 Restaurar Valores", 
+                                key=f"reset_hoy_{min_id}",
+                                help="Restaurar a los valores guardados en la base de datos"
+                            ):
+                                st.session_state[pending_restore] = True
+                                st.info("🔄 Restaurando valores originales...")
+                                import time
+                                time.sleep(0.2)
+                                st.rerun()
+            
+            # Tabla resumen de ventas de hoy con tipo de pago editable
+            st.divider()
+            st.subheader("📊 Resumen de Ventas de Hoy")
+            
+            # Mostrar tabla con selectbox editable para tipos_pago
+            opciones_tipos_pago = ["Efectivo", "Tarjeta", "Transferencia", "Efectivo, Tarjeta", "Efectivo, Transferencia", "Tarjeta, Transferencia", "Crédito", "Sin especificar"]
+            
+            # Agrupar por fecha para mostrar una fila por ticket
+            ventas_agrupadas = ventas_hoy_df.groupby('fecha').agg({
+                'id': 'min',
+                'codigo': lambda x: f"{list(x)[0]}" + (f" (+{len(x)-1})" if len(x) > 1 else ""),
+                'nombre': lambda x: f"{list(x)[0]}" + (f" (+{len(x)-1} más)" if len(x) > 1 else ""),
+                'cantidad': 'sum',
+                'total': 'sum',
+                'tipos_pago': 'first',
+                'tipo_cliente': 'first'
+            }).reset_index().sort_values('fecha', ascending=False)
+            
+            # Mostrar cada fila con selectbox editable
+            for idx, row in ventas_agrupadas.iterrows():
+                col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([0.5, 0.8, 1.2, 1.5, 0.7, 0.9, 1.5, 1.0])
+                
+                with col1:
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">🆔 {int(row["id"])}</div>', unsafe_allow_html=True)
+                
+                with col2:
+                    hora_formato = pd.to_datetime(row['fecha']).strftime('%H:%M')
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">🕐 {hora_formato}</div>', unsafe_allow_html=True)
+                
+                with col3:
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">📦 {row["codigo"]}</div>', unsafe_allow_html=True)
+                
+                with col4:
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">📋 {row["nombre"]}</div>', unsafe_allow_html=True)
+                
+                with col5:
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">📊 {row["cantidad"]}</div>', unsafe_allow_html=True)
+                
+                with col6:
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">💰 ${row["total"]:.2f}</div>', unsafe_allow_html=True)
+                
+                with col7:
+                    # Selectbox para tipos de pago (editable) - más compacto
+                    tipo_pago_actual = row['tipos_pago'] if row['tipos_pago'] in opciones_tipos_pago else "Sin especificar"
+                    
+                    # CSS para hacer el selectbox más pequeño
+                    st.markdown("""
+                    <style>
+                    div[data-testid="stSelectbox"] > div > div {
+                        min-height: 35px !important;
+                        height: 35px !important;
+                    }
+                    div[data-testid="stSelectbox"] > div > div > div {
+                        padding: 0.3rem 0.5rem !important;
+                        font-size: 0.85rem !important;
+                        line-height: 1.2 !important;
+                    }
+                    </style>
+                    """, unsafe_allow_html=True)
+                    
+                    nuevo_tipo_pago = st.selectbox(
+                        "💳",
+                        opciones_tipos_pago,
+                        index=opciones_tipos_pago.index(tipo_pago_actual),
+                        key=f"tipo_pago_tabla_{int(row['id'])}_{idx}",
+                        label_visibility="collapsed"
+                    )
+                    
+                    # Auto-guardar si cambió el tipo de pago
+                    if nuevo_tipo_pago != tipo_pago_actual:
+                        try:
+                            # Obtener el total de la venta
+                            total_venta = float(row['total'])
+                            
+                            # Resetear todos los montos
+                            monto_efectivo = 0.0
+                            monto_tarjeta = 0.0
+                            monto_transferencia = 0.0
+                            monto_credito = 0.0
+                            
+                            # Asignar el monto según el tipo de pago seleccionado
+                            if nuevo_tipo_pago == "Efectivo":
+                                monto_efectivo = total_venta
+                            elif nuevo_tipo_pago == "Tarjeta":
+                                monto_tarjeta = total_venta
+                            elif nuevo_tipo_pago == "Transferencia":
+                                monto_transferencia = total_venta
+                            elif nuevo_tipo_pago == "Crédito":
+                                monto_credito = total_venta
+                            elif nuevo_tipo_pago == "Efectivo, Tarjeta":
+                                # Dividir 50/50 entre efectivo y tarjeta
+                                monto_efectivo = total_venta / 2
+                                monto_tarjeta = total_venta / 2
+                            elif nuevo_tipo_pago == "Efectivo, Transferencia":
+                                # Dividir 50/50 entre efectivo y transferencia
+                                monto_efectivo = total_venta / 2
+                                monto_transferencia = total_venta / 2
+                            elif nuevo_tipo_pago == "Tarjeta, Transferencia":
+                                # Dividir 50/50 entre tarjeta y transferencia
+                                monto_tarjeta = total_venta / 2
+                                monto_transferencia = total_venta / 2
+                            
+                            # Actualizar la BD con tipos_pago Y los montos individuales
+                            cursor.execute("""
+                                UPDATE ventas 
+                                SET tipos_pago = ?,
+                                    monto_efectivo = ?,
+                                    monto_tarjeta = ?,
+                                    monto_transferencia = ?,
+                                    monto_credito = ?
+                                WHERE fecha = ?
+                            """, (nuevo_tipo_pago, monto_efectivo, monto_tarjeta, 
+                                  monto_transferencia, monto_credito, row['fecha']))
+                            conn.commit()
+                            st.success("✅", icon="✅")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error: {str(e)}")
+                
+                with col8:
+                    st.markdown(f'<div style="display:flex;align-items:center;height:35px;font-size:0.85rem;">👤 {row["tipo_cliente"]}</div>', unsafe_allow_html=True)
+    
+    except Exception as e:
+        st.error(f"❌ Error al cargar ventas de hoy: {str(e)}")
     
     # Script para hacer focus automático en el campo de código después de finalizar venta
     if st.session_state.get('venta_finalizada', False):
@@ -2448,3 +3284,19 @@ def mostrar_mensaje_info(mensaje):
         💡 {mensaje}
     </div>
     """, unsafe_allow_html=True)
+
+# ======================== PUNTO DE ENTRADA PRINCIPAL ========================
+
+# Solo verificar sesión si se ejecuta ventas.py directamente (no desde main.py)
+if __name__ == "__main__":
+    # Verificar sesión administrativa
+    if not verificar_sesion_admin():
+        # Mostrar formulario de login si no hay sesión válida
+        mostrar_formulario_login("VENTAS")
+    else:
+        # Si hay sesión válida, mostrar la aplicación
+        mostrar()
+else:
+    # Si se importa desde otro módulo (main.py), asumir sesión ya verificada
+    # El módulo será llamado por main.py solo si la sesión es válida
+    pass

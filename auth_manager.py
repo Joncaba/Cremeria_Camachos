@@ -6,16 +6,109 @@ Todos los módulos deben usar este sistema para mantener consistencia
 import streamlit as st
 import hashlib
 from datetime import datetime, timedelta
-import config
+import os
+import json
+import sqlite3
 from db_adapter import get_db_adapter
 
 # Inicializar adaptador de base de datos
 db_auth = get_db_adapter()
 
+# Salt para contraseñas (el mismo que usamos para crear admin)
+PASSWORD_SALT = os.getenv("PASSWORD_SALT", "default-salt")
+
+# Archivo para almacenar sesiones persistentes
+SESSIONS_DB = "sessiones.db"
+
+def _inicializar_sesiones_db():
+    """Inicializar base de datos de sesiones"""
+    conn = sqlite3.connect(SESSIONS_DB)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sesiones (
+            token TEXT PRIMARY KEY,
+            usuario TEXT NOT NULL,
+            inicio DATETIME NOT NULL,
+            expira DATETIME NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def _limpiar_sesiones_expiradas():
+    """Eliminar sesiones expiradas"""
+    try:
+        conn = sqlite3.connect(SESSIONS_DB)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM sesiones WHERE expira < ?', (datetime.now(),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error al limpiar sesiones: {e}")
+
+def _crear_token_sesion(usuario):
+    """Crear token de sesión persistente"""
+    _inicializar_sesiones_db()
+    
+    token = hashlib.sha256(f"{usuario}{datetime.now().isoformat()}".encode()).hexdigest()
+    inicio = datetime.now()
+    expira = inicio + timedelta(hours=12)
+    
+    try:
+        conn = sqlite3.connect(SESSIONS_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO sesiones (token, usuario, inicio, expira)
+            VALUES (?, ?, ?, ?)
+        ''', (token, usuario, inicio, expira))
+        conn.commit()
+        conn.close()
+        return token
+    except Exception as e:
+        print(f"Error al crear token: {e}")
+        return None
+
+def _validar_token_sesion(token):
+    """Validar token de sesión"""
+    if not token:
+        return None
+    
+    _limpiar_sesiones_expiradas()
+    
+    try:
+        conn = sqlite3.connect(SESSIONS_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT usuario, expira FROM sesiones 
+            WHERE token = ? AND expira > ?
+        ''', (token, datetime.now()))
+        resultado = cursor.fetchone()
+        conn.close()
+        
+        if resultado:
+            return {
+                'usuario': resultado[0],
+                'expira': resultado[1]
+            }
+        return None
+    except Exception as e:
+        print(f"Error al validar token: {e}")
+        return None
+
+def _eliminar_token_sesion(token):
+    """Eliminar token de sesión"""
+    try:
+        conn = sqlite3.connect(SESSIONS_DB)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM sesiones WHERE token = ?', (token,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error al eliminar token: {e}")
+
 def hash_password(password):
     """Crear hash de la contraseña con salt"""
-    salt = config.get_password_salt()
-    return hashlib.sha256((password + salt).encode()).hexdigest()
+    return hashlib.sha256((password + PASSWORD_SALT).encode()).hexdigest()
 
 def verificar_credenciales(usuario, password):
     """Verificar si las credenciales son correctas"""
@@ -34,19 +127,52 @@ def verificar_credenciales(usuario, password):
 
 def iniciar_sesion(usuario):
     """Iniciar sesión administrativa global (12 horas de duración)"""
+    # Crear token persistente
+    token = _crear_token_sesion(usuario)
+    
+    # Guardar en session_state
     st.session_state.admin_autenticado = True
     st.session_state.usuario_admin = usuario
+    st.session_state.session_token = token
     st.session_state.session_timestamp = datetime.now()
+    
+    # Guardar token en query parameters para persistencia
+    st.query_params['session_token'] = token
+    
+    # Sincronizar usuario con Supabase
+    try:
+        from sync_manager import get_sync_manager
+        sync_manager = get_sync_manager()
+        
+        # Obtener datos del usuario
+        user_data = db_auth.obtener_usuario(usuario)
+        if user_data:
+            sync_manager.sync_usuario_to_supabase(user_data)
+    except Exception as e:
+        print(f"No se pudo sincronizar usuario con Supabase: {e}")
 
 def verificar_sesion_admin():
     """Verificar si hay una sesión administrativa activa y no ha expirado (12 horas)"""
+    # Primero intentar recuperar sesión desde token persistente (via query params)
+    token = st.query_params.get('session_token', None)
+    
+    if token:
+        session_data = _validar_token_sesion(token)
+        if session_data:
+            # Restaurar sesión en session_state
+            st.session_state.admin_autenticado = True
+            st.session_state.usuario_admin = session_data['usuario']
+            st.session_state.session_token = token
+            st.session_state.session_timestamp = datetime.now()
+            return True
+    
+    # Si no hay token válido en URL, verificar session_state
     if not st.session_state.get('admin_autenticado', False):
         return False
     
     # Verificar si existe timestamp de sesión
     session_timestamp = st.session_state.get('session_timestamp', None)
     if session_timestamp is None:
-        # Si no hay timestamp, crear uno ahora (para sesiones antiguas)
         st.session_state.session_timestamp = datetime.now()
         return True
     
@@ -61,10 +187,20 @@ def verificar_sesion_admin():
 
 def cerrar_sesion_admin():
     """Cerrar sesión administrativa global"""
+    # Eliminar token persistente
+    token = st.session_state.get('session_token', None)
+    if token:
+        _eliminar_token_sesion(token)
+    
+    # Limpiar query parameters
+    st.query_params.clear()
+    
+    # Limpiar session_state
     keys_to_delete = [
         'admin_autenticado',
         'usuario_admin',
         'session_timestamp',
+        'session_token',
         # Claves antiguas de módulos específicos (por compatibilidad)
         'admin_pedidos_autenticado',
         'usuario_admin_pedidos',
@@ -77,53 +213,53 @@ def cerrar_sesion_admin():
             del st.session_state[key]
 
 def obtener_tiempo_restante():
-    """Obtener tiempo restante de la sesión en formato (horas, minutos)"""
-    session_timestamp = st.session_state.get('session_timestamp', datetime.now())
-    tiempo_transcurrido = datetime.now() - session_timestamp
-    tiempo_restante = timedelta(hours=12) - tiempo_transcurrido
+    """Obtener tiempo restante de la sesión en formato texto"""
+    token = st.session_state.get('session_token', None)
+    if not token:
+        return "Sin sesión activa"
+    
+    session_data = _validar_token_sesion(token)
+    if not session_data:
+        return "Sesión expirada"
+    
+    expira = datetime.fromisoformat(session_data['expira'])
+    tiempo_restante = expira - datetime.now()
+    
+    if tiempo_restante.total_seconds() <= 0:
+        return "Sesión expirada"
     
     horas_restantes = int(tiempo_restante.total_seconds() // 3600)
     minutos_restantes = int((tiempo_restante.total_seconds() % 3600) // 60)
     
-    return horas_restantes, minutos_restantes
+    return f"Sesión: {horas_restantes}h {minutos_restantes}m restantes"
 
 def mostrar_formulario_login(titulo_modulo=""):
-    """Mostrar formulario de login unificado"""
-    titulo = f"🔐 ACCESO ADMINISTRATIVO{' - ' + titulo_modulo if titulo_modulo else ''}"
+    """Mostrar formulario de login unificado - Versión simplificada"""
     
-    st.markdown(f"""
-    <div style="background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 50%, #fecfef 100%); 
-                padding: 2rem; border-radius: 15px; text-align: center; margin: 1rem 0;">
-        <h2 style="color: #8e44ad; margin-bottom: 1rem;">{titulo}</h2>
-        <p style="color: #2c3e50; font-size: 1.1rem; margin-bottom: 0;">
-            Se requiere autenticación de administrador. La sesión durará 12 horas.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.title("🏪 Punto de Venta")
+    st.subheader("Cremería")
+    st.divider()
     
     # Generar key único basado en el módulo
     form_key = f"login_form_{titulo_modulo.lower().replace(' ', '_')}" if titulo_modulo else "login_form"
     
     with st.form(form_key):
-        col_login1, col_login2, col_login3 = st.columns([1, 2, 1])
+        st.write("**🔐 Iniciar Sesión**")
         
-        with col_login2:
-            usuario = st.text_input("👤 Usuario:", placeholder="Ingresa tu usuario")
-            password = st.text_input("🔑 Contraseña:", type="password")
-            
-            col_btn_login = st.columns([1, 2, 1])
-            with col_btn_login[1]:
-                submit_login = st.form_submit_button("🔓 INICIAR SESIÓN", type="primary")
-            
-            if submit_login:
-                if usuario and password:
-                    if verificar_credenciales(usuario, password):
-                        iniciar_sesion(usuario)
-                        st.success("✅ ¡Acceso concedido! Sesión válida por 12 horas.")
-                        import time
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("❌ Credenciales incorrectas. Inténtalo de nuevo.")
+        usuario = st.text_input("👤 Usuario:", placeholder="Ingrese su usuario")
+        password = st.text_input("🔑 Contraseña:", type="password")
+        
+        submit_login = st.form_submit_button("✔️ Ingresar", type="primary", use_container_width=True)
+        
+        if submit_login:
+            if usuario and password:
+                if verificar_credenciales(usuario, password):
+                    iniciar_sesion(usuario)
+                    st.success("✅ ¡Acceso concedido! Sesión válida por 12 horas.")
+                    import time
+                    time.sleep(1)
+                    st.rerun()
                 else:
-                    st.warning("⚠️ Por favor, completa ambos campos.")
+                    st.error("❌ Usuario o contraseña incorrectos.")
+            else:
+                st.warning("⚠️ Por favor ingresa usuario y contraseña.")

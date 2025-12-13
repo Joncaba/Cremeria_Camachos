@@ -1,0 +1,183 @@
+# REFERENCIA RÁPIDA: Código vs Número de Producto
+
+## 🔄 Mapeo de Búsqueda
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      USUARIO ESCANEA CÓDIGO                         │
+└─────────────────────────────────────────────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  ¿Tiene 13 dígitos? (Ticket de báscula)                             │
+│  ├─ SÍ: extrae primeros 9 → busca como código de 9 dígitos        │
+│  └─ NO: busca tal cual                                              │
+└─────────────────────────────────────────────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  INTENTA 5 ESTRATEGIAS (EN ORDEN):                                  │
+│                                                                      │
+│  1️⃣ Búsqueda exacta:     WHERE codigo = '172'                      │
+│  2️⃣ PLU:                 WHERE numero_producto = 172               │
+│  3️⃣ Extracción PLU:      Extrae últimos 5-7 dígitos                │
+│  4️⃣ LIKE báscula:        WHERE codigo LIKE '750111102%' [NUEVA]   │
+│  5️⃣ Búsqueda parcial:    WHERE codigo LIKE '%xxxxx'                │
+└─────────────────────────────────────────────────────────────────────┘
+                               ↓
+                    ¿ENCONTRÓ PRODUCTO?
+                    ├─ SÍ → Agrega a carrito ✓
+                    └─ NO → Muestra error ✗
+```
+
+## 📝 Tabla de Ejemplos
+
+| Entrada | Tipo | Estrategia | BD Actual | Resultado |
+|---------|------|-----------|-----------|-----------|
+| `172` | Código simple | 1 (exacta) | código=172 | ✓ ENCONTRADO |
+| `7501111021029` | Barcode | 1 (exacta) | código=7501111021029 | ✓ ENCONTRADO |
+| `7501111021029` | Ticket báscula | 4 (LIKE) | código=7501111021029 | ✓ ENCONTRADO |
+| `750111102` | Código báscula | 4 (LIKE) | código=7501111021029 | ✓ ENCONTRADO |
+| `80332` | PLU | 2 (numero_producto) | numero_producto=80332 | ✓ ENCONTRADO |
+| `999999` | No existe | - | - | ✗ ERROR |
+
+## 🏪 Estructura BD Actual
+
+```
+TABLA: productos
+┌──────────────────┬──────────────────┬──────────────────────┐
+│ codigo           │ numero_producto  │ nombre               │
+├──────────────────┼──────────────────┼──────────────────────┤
+│ 172              │ 172              │ MANTEQUILLA 90GR     │
+│ 7501111021029    │ 7501111021029    │ MANTEQUILLA 1KG      │
+│ 200006500        │ 200006500        │ QUESO COTIJA         │
+│ 44444            │ NULL             │ QUESO (viejo)        │
+│ ...              │ ...              │ ...                  │
+└──────────────────┴──────────────────┴──────────────────────┘
+```
+
+## 🎯 Decisión de Código vs PLU
+
+### Recomendación: SEPARAR cuando sea posible
+
+**BIEN:**
+```
+codigo: 7501111021029  (barcode del proveedor)
+numero_producto: 80332 (PLU simple para búsquedas)
+```
+
+**TAMBIÉN BIEN:**
+```
+codigo: 172            (PLU simple)
+numero_producto: 172   (mismo valor)
+```
+
+**EVITAR:**
+```
+codigo: PLU-172        (prefijo añadido)
+numero_producto: NULL  (no usar)
+```
+
+## 🔧 Diagrama de Decisión
+
+```
+¿Producto nuevo?
+│
+├─ Sí: ¿Tienes barcode?
+│      ├─ Sí: codigo = barcode, numero_producto = PLU simple
+│      └─ No: codigo = PLU simple, numero_producto = PLU simple
+│
+└─ No: ¿Necesitas cambiar código?
+       ├─ Sí: python agregar_codigo_barras.py <PLU> <barcode>
+       └─ No: Mantén como está
+```
+
+## 🧪 Test Rápido
+
+```bash
+# 1. Ver si existe
+python diagnosticar_busqueda.py 172
+
+# 2. Si no funciona, verificar en BD
+sqlite3 pos_cremeria.db "SELECT codigo, numero_producto, nombre FROM productos WHERE nombre LIKE '%MANTEQUILLA%';"
+
+# 3. Si falta, agregar
+python sincronizar_plu_a_productos.py
+
+# 4. Si existe pero código está mal, actualizar
+python agregar_codigo_barras.py 172 <barcode_correcto>
+```
+
+## 📊 Estado Actual (Diciembre 2025)
+
+✅ **Completado:**
+- 544 productos importados de iTegra
+- Números de PLU poblados en numero_producto
+- Códigos numéricos (1-543) O barcodes completos registrados
+- Tabla codigos_barras con histórico
+- Búsqueda con 5 estrategias
+- Inventario muestra PLU
+
+⚠️ **Pendiente (Opcional):**
+- Asignar barcodes a todos los productos
+- Crear mapping para códigos de báscula especiales
+- Documentación para staff
+
+🔴 **Problemas Conocidos:**
+- Algunos productos sin numero_producto (15 antiguos)
+- Código de báscula 2080332010005 no existe en BD (ejemplo del usuario)
+
+## 🚀 Comandos Útiles
+
+```bash
+# Ver primeros 10 productos
+sqlite3 pos_cremeria.db "SELECT codigo, numero_producto, nombre FROM productos LIMIT 10;"
+
+# Buscar producto específico
+sqlite3 pos_cremeria.db "SELECT codigo, numero_producto, nombre FROM productos WHERE nombre LIKE '%MANTEQUILLA%';"
+
+# Diagnosticar código
+python diagnosticar_busqueda.py 172
+
+# Ver productos sin numero_producto
+sqlite3 pos_cremeria.db "SELECT codigo, nombre FROM productos WHERE numero_producto IS NULL;"
+
+# Contar por tipo
+sqlite3 pos_cremeria.db "SELECT COUNT(*), COUNT(numero_producto) FROM productos;"
+```
+
+## 💡 Tips Pro
+
+1. **Para códigos de báscula desconocidos**: Usa `diagnosticar_busqueda.py` ANTES de escanear
+2. **Para asignar barcodes**: `python agregar_codigo_barras.py <plu> <barcode>`
+3. **Para ver PLU**: Abre inventario y mira columna "🔢 PLU"
+4. **Para troubleshoot**: Siempre verifica con diagnóstico primero
+5. **Backup antes de cambios**: `sqlite3 pos_cremeria.db ".backup backup.db"`
+
+## ❓ Preguntas Frecuentes
+
+**P: ¿Por qué no encuentra mi código?**
+A: Usa `python diagnosticar_busqueda.py <código>` para verificar
+
+**P: ¿Puedo tener múltiples códigos para un producto?**
+A: No, un solo `codigo`. Si necesitas mapear múltiples, usa tabla auxiliar
+
+**P: ¿Qué pasa con el numero_producto NULL?**
+A: Son productos viejos. Actualízalos o elimínalos
+
+**P: ¿Cómo cambio el código de un producto?**
+A: Usa `agregar_codigo_barras.py` - actualiza el código pero mantiene numero_producto
+
+**P: ¿El número_producto puede cambiar?**
+A: No, es inmutable. Es tu identificador único
+
+## 📞 Contacto Técnico
+
+Para problemas específicos, proporciona:
+1. Código escaneado
+2. Salida de: `python diagnosticar_busqueda.py <código>`
+3. Salida de: `sqlite3 pos_cremeria.db "SELECT * FROM productos WHERE nombre LIKE '%...%';"`
+
+---
+
+**Última actualización:** Diciembre 2025
+**Sistema:** POS Cremería Camacho's
+**Status:** ✅ PRODUCTIVO

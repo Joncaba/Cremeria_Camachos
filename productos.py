@@ -239,13 +239,13 @@ def obtener_productos():
         
         # Calcular valor del inventario según tipo
         df['valor_inventario_compra'] = df.apply(
-            lambda row: (row['stock_kg'] * row['precio_compra']) if row.get('tipo_venta') == 'granel' 
+            lambda row: (row['stock_kg'] * row['precio_compra']) if row.get('tipo_venta') in ['granel', 'kg'] 
                        else (row['stock'] * row['precio_compra']), 
             axis=1
         )
         
         df['valor_inventario_venta'] = df.apply(
-            lambda row: (row['stock_kg'] * row['precio_por_kg']) if row.get('tipo_venta') == 'granel' 
+            lambda row: (row['stock_kg'] * row['precio_por_kg']) if row.get('tipo_venta') in ['granel', 'kg'] 
                        else (row['stock'] * row['precio_normal']), 
             axis=1
         )
@@ -360,7 +360,7 @@ def cargar_datos_producto_con_estructura(codigo_producto):
             'precio_mayoreo_2': convertir_float_seguro(producto_dict.get('precio_mayoreo_2')),
             'precio_mayoreo_3': convertir_float_seguro(producto_dict.get('precio_mayoreo_3')),
             'stock': convertir_int_seguro(producto_dict.get('stock')),
-            'tipo_venta': str(producto_dict.get('tipo_venta', 'unidad')),
+            'tipo_venta': 'kg' if str(producto_dict.get('tipo_venta', 'unidad')) == 'granel' else str(producto_dict.get('tipo_venta', 'unidad')),
             'categoria': str(producto_dict.get('categoria', 'cremeria')),
             'precio_por_kg': convertir_float_seguro(producto_dict.get('precio_por_kg')),
             'peso_unitario': convertir_float_seguro(producto_dict.get('peso_unitario')),
@@ -423,8 +423,8 @@ def mostrar():
     with col_header1:
         if es_admin:
             # Obtener tiempo restante usando función centralizada
-            horas_restantes, minutos_restantes = obtener_tiempo_restante()
-            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | Sesión: {horas_restantes}h {minutos_restantes}m restantes")
+            tiempo_restante = obtener_tiempo_restante()
+            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | {tiempo_restante}")
         else:
             st.info("👀 **Modo Solo Lectura** - Los productos se muestran en modo consulta únicamente")
     
@@ -735,7 +735,7 @@ def mostrar():
             with col_debug2:
                 st.write(f"**Precio normal:** ${st.session_state.form_data['precio_normal']:.2f}")
                 st.write(f"**Stock:** {st.session_state.form_data['stock']} unidades")
-                if st.session_state.form_data['tipo_venta'] == 'granel':
+                if st.session_state.form_data['tipo_venta'] in ['granel', 'kg']:
                     st.write(f"**Peso unitario:** {st.session_state.form_data['peso_unitario']:.3f} Kg")
                     st.write(f"**Precio por Kg:** ${st.session_state.form_data['precio_por_kg']:.2f}")
     else:
@@ -754,23 +754,23 @@ def mostrar():
         
         # Selector de tipo de venta FUERA del formulario para detectar cambios
         tipo_venta_index = 0 if tipo_venta_actual == 'unidad' else 1
-        print(f"DEBUG - Índice calculado: {tipo_venta_index} (0=unidad, 1=granel)")
+        print(f"DEBUG - Índice calculado: {tipo_venta_index} (0=unidad, 1=kg/granel)")
         
         # IMPORTANTE: No usar key cuando estamos en modo edición para forzar actualización
         if st.session_state.form_data['modo_edicion']:
             tipo_venta_seleccionado = st.selectbox(
                 "Tipo de Venta:",
-                ["unidad", "granel"],
+                ["unidad", "kg"],
                 index=tipo_venta_index,
-                help="Unidad: se vende por piezas | Granel: se vende por peso",
+                help="Unidad: se vende por piezas | Kg/Granel: se vende por peso",
                 disabled=not es_admin  # Solo deshabilitar si no es admin
             )
         else:
             tipo_venta_seleccionado = st.selectbox(
                 "Tipo de Venta:",
-                ["unidad", "granel"],
+                ["unidad", "kg"],
                 index=tipo_venta_index,
-                help="Unidad: se vende por piezas | Granel: se vende por peso",
+                help="Unidad: se vende por piezas | Kg/Granel: se vende por peso",
                 disabled=not es_admin,  # Solo deshabilitar si no es admin
                 key="tipo_venta_selector_principal"
             )
@@ -1459,8 +1459,9 @@ def mostrar():
             # Formatear tipo de venta con iconos
             df_display['tipo_venta'] = df_display['tipo_venta'].map({
                 'unidad': '🏷️ Unidad',
-                'granel': '⚖️ Granel'
-            })
+                'granel': '⚖️ Granel',
+                'kg': '⚖️ Granel'
+            }).fillna('🏷️ Unidad')
             
             # Configuración de columnas
             column_config = {

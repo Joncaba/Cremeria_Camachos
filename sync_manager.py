@@ -868,6 +868,135 @@ class SyncManager:
             print(f"Error al sincronizar créditos desde Supabase: {e}")
             return {'success': 0, 'failed': 0, 'error': str(e)}
 
+
+    # ==================== USUARIOS ====================
+    
+    def sync_usuario_to_supabase(self, usuario_data: Dict) -> tuple[bool, str]:
+        """Sincronizar un usuario a Supabase"""
+        if not self.is_online():
+            return (False, 'Sin conexión a Supabase')
+        
+        try:
+            # Verificar si el usuario ya existe
+            response = self.supabase_db.client.table('usuarios').select('id').eq('usuario', usuario_data.get('usuario')).execute()
+            
+            if response.data:
+                # Actualizar usuario existente
+                self.supabase_db.client.table('usuarios').update(usuario_data).eq('usuario', usuario_data.get('usuario')).execute()
+                return (True, 'Usuario actualizado en Supabase')
+            else:
+                # Insertar nuevo usuario
+                self.supabase_db.client.table('usuarios').insert(usuario_data).execute()
+                return (True, 'Usuario insertado en Supabase')
+        except Exception as e:
+            print(f"Error al sincronizar usuario a Supabase: {e}")
+            return (False, str(e))
+    
+    def sync_all_usuarios_to_supabase(self) -> Dict[str, int]:
+        """Sincronizar todos los usuarios de SQLite a Supabase"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión a Supabase'}
+        
+        try:
+            conn = sqlite3.connect(self.sqlite_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM usuarios")
+            usuarios = cursor.fetchall()
+            conn.close()
+            
+            success = 0
+            failed = 0
+            
+            for usuario in usuarios:
+                usuario_dict = dict(usuario)
+                resultado, _ = self.sync_usuario_to_supabase(usuario_dict)
+                if resultado:
+                    success += 1
+                else:
+                    failed += 1
+            
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar usuarios a Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+    
+    def sync_usuario_from_supabase(self, usuario_nombre: str) -> bool:
+        """Sincronizar un usuario desde Supabase a SQLite"""
+        if not self.is_online():
+            return False
+        
+        try:
+            response = self.supabase_db.client.table('usuarios').select('*').eq('usuario', usuario_nombre).execute()
+            
+            if not response.data:
+                return False
+            
+            usuario_data = response.data[0]
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO usuarios (id, usuario, password, activo)
+                VALUES (?, ?, ?, ?)
+            ''', (
+                usuario_data.get('id'),
+                usuario_data.get('usuario'),
+                usuario_data.get('password'),
+                usuario_data.get('activo', 1)
+            ))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error al sincronizar usuario desde Supabase: {e}")
+            return False
+    
+    def sync_usuarios_from_supabase(self) -> Dict[str, int]:
+        """Sincronizar todos los usuarios desde Supabase a SQLite"""
+        if not self.is_online():
+            return {'success': 0, 'failed': 0, 'error': 'Sin conexión'}
+        
+        try:
+            response = self.supabase_db.client.table('usuarios').select('*').execute()
+            usuarios = response.data
+            
+            if not usuarios:
+                return {'success': 0, 'failed': 0, 'message': 'No hay usuarios en Supabase'}
+            
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            success = 0
+            failed = 0
+            
+            for usuario in usuarios:
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO usuarios (id, usuario, password, activo)
+                        VALUES (?, ?, ?, ?)
+                    ''', (
+                        usuario.get('id'),
+                        usuario.get('usuario'),
+                        usuario.get('password'),
+                        usuario.get('activo', 1)
+                    ))
+                    success += 1
+                except Exception as e:
+                    print(f"Error al insertar usuario {usuario.get('usuario')}: {e}")
+                    failed += 1
+            
+            conn.commit()
+            conn.close()
+            return {'success': success, 'failed': failed}
+            
+        except Exception as e:
+            print(f"Error al sincronizar usuarios desde Supabase: {e}")
+            return {'success': 0, 'failed': 0, 'error': str(e)}
+
 # Instancia global del gestor de sincronización
 _sync_manager = None
 

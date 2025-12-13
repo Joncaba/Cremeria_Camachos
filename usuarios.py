@@ -8,8 +8,9 @@ from datetime import datetime
 DB_PATH = "pos_cremeria.db"
 
 def hash_password(password):
-    """Encriptar contraseña usando SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Encriptar contraseña usando SHA-256 con salt"""
+    salt = "default-salt"
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def crear_tabla_usuarios():
     """Crear tabla de usuarios si no existe"""
@@ -99,17 +100,19 @@ def obtener_todos_usuarios():
     conn = sqlite3.connect(DB_PATH)
     try:
         query = """
-            SELECT id, usuario, nombre_completo, rol, activo, 
-                   fecha_creacion, ultimo_acceso, creado_por
-            FROM usuarios_admin
-            ORDER BY fecha_creacion DESC
+            SELECT id, usuario, activo, rol, nombre_completo
+            FROM usuarios
+            ORDER BY usuario
         """
         df = pd.read_sql_query(query, conn)
         return df
+    except Exception as e:
+        st.error(f"Error al obtener usuarios: {e}")
+        return pd.DataFrame()
     finally:
         conn.close()
 
-def crear_usuario(usuario, password, nombre_completo, rol, creado_por):
+def crear_usuario(usuario, password, rol):
     """Crear un nuevo usuario"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -117,11 +120,26 @@ def crear_usuario(usuario, password, nombre_completo, rol, creado_por):
     try:
         password_hash = hash_password(password)
         cursor.execute('''
-            INSERT INTO usuarios_admin (usuario, password, nombre_completo, rol, creado_por)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (usuario, password_hash, nombre_completo, rol, creado_por))
+            INSERT INTO usuarios (usuario, password, activo, rol)
+            VALUES (?, ?, 1, ?)
+        ''', (usuario, password_hash, rol))
         
         conn.commit()
+        
+        # Sincronizar con Supabase
+        try:
+            from sync_manager import get_sync_manager
+            sync_manager = get_sync_manager()
+            user_data = {
+                'usuario': usuario,
+                'password': password_hash,
+                'activo': 1,
+                'rol': rol
+            }
+            sync_manager.sync_usuario_to_supabase(user_data)
+        except Exception as e:
+            print(f"No se pudo sincronizar usuario con Supabase: {e}")
+        
         return True, "Usuario creado exitosamente"
     except sqlite3.IntegrityError:
         return False, "El nombre de usuario ya existe"
@@ -139,12 +157,25 @@ def actualizar_password(usuario, nueva_password):
     try:
         password_hash = hash_password(nueva_password)
         cursor.execute('''
-            UPDATE usuarios_admin 
+            UPDATE usuarios 
             SET password = ?
             WHERE usuario = ?
         ''', (password_hash, usuario))
         
         conn.commit()
+        
+        # Sincronizar con Supabase
+        try:
+            from sync_manager import get_sync_manager
+            sync_manager = get_sync_manager()
+            user_data = {
+                'usuario': usuario,
+                'password': password_hash
+            }
+            sync_manager.sync_usuario_to_supabase(user_data)
+        except Exception as e:
+            print(f"No se pudo sincronizar usuario con Supabase: {e}")
+        
         return True, "Contraseña actualizada exitosamente"
     except Exception as e:
         conn.rollback()
@@ -159,17 +190,134 @@ def cambiar_estado_usuario(usuario, activo):
     
     try:
         cursor.execute('''
-            UPDATE usuarios_admin 
+            UPDATE usuarios 
             SET activo = ?
             WHERE usuario = ?
         ''', (1 if activo else 0, usuario))
         
         conn.commit()
+        
+        # Sincronizar con Supabase
+        try:
+            from sync_manager import get_sync_manager
+            sync_manager = get_sync_manager()
+            user_data = {
+                'usuario': usuario,
+                'activo': 1 if activo else 0
+            }
+            sync_manager.sync_usuario_to_supabase(user_data)
+        except Exception as e:
+            print(f"No se pudo sincronizar usuario con Supabase: {e}")
+        
         estado = "activado" if activo else "desactivado"
         return True, f"Usuario {estado} exitosamente"
     except Exception as e:
         conn.rollback()
         return False, f"Error al cambiar estado: {str(e)}"
+    finally:
+        conn.close()
+
+def cambiar_rol_usuario(usuario, nuevo_rol):
+    """Cambiar rol de un usuario"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            UPDATE usuarios 
+            SET rol = ?
+            WHERE usuario = ?
+        ''', (nuevo_rol, usuario))
+        
+        conn.commit()
+        
+        # Sincronizar con Supabase
+        try:
+            from sync_manager import get_sync_manager
+            sync_manager = get_sync_manager()
+            user_data = {
+                'usuario': usuario,
+                'rol': nuevo_rol
+            }
+            sync_manager.sync_usuario_to_supabase(user_data)
+        except Exception as e:
+            print(f"No se pudo sincronizar usuario con Supabase: {e}")
+        
+        return True, "Rol actualizado exitosamente"
+    except Exception as e:
+        conn.rollback()
+        return False, f"Error al cambiar rol: {str(e)}"
+    finally:
+        conn.close()
+
+def cambiar_nombre_usuario(usuario, nuevo_nombre):
+    """Cambiar nombre completo de un usuario"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            UPDATE usuarios 
+            SET nombre_completo = ?
+            WHERE usuario = ?
+        ''', (nuevo_nombre, usuario))
+        
+        conn.commit()
+        
+        # Sincronizar con Supabase
+        try:
+            from sync_manager import get_sync_manager
+            sync_manager = get_sync_manager()
+            user_data = {
+                'usuario': usuario,
+                'nombre_completo': nuevo_nombre
+            }
+            sync_manager.sync_usuario_to_supabase(user_data)
+        except Exception as e:
+            print(f"No se pudo sincronizar usuario con Supabase: {e}")
+        
+        return True, "Nombre actualizado exitosamente"
+    except Exception as e:
+        conn.rollback()
+        return False, f"Error al cambiar nombre: {str(e)}"
+    finally:
+        conn.close()
+
+def cambiar_usuario_login(usuario_actual, nuevo_usuario):
+    """Cambiar nombre de usuario (login)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    try:
+        # Verificar que el nuevo nombre no exista
+        cursor.execute("SELECT COUNT(*) FROM usuarios WHERE usuario = ?", (nuevo_usuario,))
+        if cursor.fetchone()[0] > 0:
+            return False, "El nombre de usuario ya existe en el sistema"
+        
+        # Cambiar el nombre de usuario
+        cursor.execute('''
+            UPDATE usuarios 
+            SET usuario = ?
+            WHERE usuario = ?
+        ''', (nuevo_usuario, usuario_actual))
+        
+        conn.commit()
+        
+        # Sincronizar con Supabase
+        try:
+            from sync_manager import get_sync_manager
+            sync_manager = get_sync_manager()
+            user_data = {
+                'usuario': nuevo_usuario
+            }
+            sync_manager.sync_usuario_to_supabase(user_data)
+        except Exception as e:
+            print(f"No se pudo sincronizar usuario con Supabase: {e}")
+        
+        return True, f"Usuario cambiado de '{usuario_actual}' a '{nuevo_usuario}' exitosamente"
+    except Exception as e:
+        conn.rollback()
+        return False, f"Error al cambiar usuario: {str(e)}"
     finally:
         conn.close()
 
@@ -221,14 +369,17 @@ def mostrar():
     # Crear tabla si no existe
     crear_tabla_usuarios()
     
-    # Verificar que el usuario actual sea administrador
-    if 'usuario_actual' not in st.session_state:
+    # Verificar que el usuario actual sea administrador (usando auth_manager)
+    from auth_manager import verificar_sesion_admin
+    
+    if not verificar_sesion_admin():
         st.error("❌ Debe iniciar sesión para acceder a este módulo")
         return
     
-    if not verificar_es_admin(st.session_state.usuario_actual):
-        st.error("❌ No tiene permisos de administrador para acceder a este módulo")
-        st.info("💡 Solo los usuarios con rol de administrador pueden gestionar usuarios")
+    # Solo mostrar si hay usuario autenticado
+    usuario_actual = st.session_state.get('usuario_admin', None)
+    if not usuario_actual:
+        st.error("❌ No hay sesión activa")
         return
     
     # CSS personalizado para las tabs
@@ -269,6 +420,9 @@ def mostrar():
     }
     </style>
     """, unsafe_allow_html=True)
+    
+    # Mostrar info del usuario actual
+    st.info(f"👤 Usuario autenticado: **{usuario_actual}**")
     
     # Tabs para organizar las funciones
     tab1, tab2, tab3 = st.tabs([
@@ -328,7 +482,7 @@ def mostrar_lista_usuarios():
     with col_filtro2:
         filtro_rol = st.selectbox(
             "🔍 Filtrar por rol:",
-            ["Todos", "Administrador", "Usuario"]
+            ["Todos", "admin", "gerente", "vendedor"]
         )
     
     # Aplicar filtros
@@ -339,10 +493,8 @@ def mostrar_lista_usuarios():
     elif filtro_estado == "Inactivos":
         df_filtrado = df_filtrado[df_filtrado['activo'] == 0]
     
-    if filtro_rol == "Administrador":
-        df_filtrado = df_filtrado[df_filtrado['rol'] == 'admin']
-    elif filtro_rol == "Usuario":
-        df_filtrado = df_filtrado[df_filtrado['rol'] == 'usuario']
+    if filtro_rol != "Todos":
+        df_filtrado = df_filtrado[df_filtrado['rol'] == filtro_rol]
     
     # Mostrar tabla
     st.subheader(f"📊 Usuarios Encontrados: {len(df_filtrado)}")
@@ -350,15 +502,13 @@ def mostrar_lista_usuarios():
     # Formatear datos para mostrar
     df_display = df_filtrado.copy()
     df_display['activo'] = df_display['activo'].apply(lambda x: '✅ Activo' if x == 1 else '❌ Inactivo')
-    df_display['rol'] = df_display['rol'].apply(lambda x: '🔑 Admin' if x == 'admin' else '👤 Usuario')
     
-    # Formatear fechas
-    if 'fecha_creacion' in df_display.columns:
-        df_display['fecha_creacion'] = pd.to_datetime(df_display['fecha_creacion']).dt.strftime('%d/%m/%Y %H:%M')
-    
-    if 'ultimo_acceso' in df_display.columns:
-        df_display['ultimo_acceso'] = pd.to_datetime(df_display['ultimo_acceso'], errors='coerce').dt.strftime('%d/%m/%Y %H:%M')
-        df_display['ultimo_acceso'] = df_display['ultimo_acceso'].fillna('Nunca')
+    rol_map = {
+        'admin': '🔑 Administrador',
+        'gerente': '👔 Gerente',
+        'vendedor': '👤 Vendedor'
+    }
+    df_display['rol'] = df_display['rol'].apply(lambda x: rol_map.get(x, x))
     
     st.dataframe(
         df_display,
@@ -367,10 +517,7 @@ def mostrar_lista_usuarios():
             "usuario": "👤 Usuario",
             "nombre_completo": "📝 Nombre Completo",
             "rol": "🔐 Rol",
-            "activo": "📊 Estado",
-            "fecha_creacion": "📅 Fecha Creación",
-            "ultimo_acceso": "🕐 Último Acceso",
-            "creado_por": "👨‍💼 Creado Por"
+            "activo": "📊 Estado"
         },
         hide_index=True,
         width='stretch'
@@ -395,15 +542,26 @@ def mostrar_crear_usuario():
             nuevo_nombre = st.text_input(
                 "📝 Nombre Completo:",
                 placeholder="Ej: Juan Pérez García",
-                help="Nombre completo del usuario"
+                help="Nombre completo del usuario (opcional)"
             )
-        
-        with col2:
+            
             nuevo_password = st.text_input(
                 "🔒 Contraseña:",
                 type="password",
                 placeholder="Mínimo 6 caracteres",
                 help="Contraseña para iniciar sesión"
+            )
+        
+        with col2:
+            nuevo_rol = st.selectbox(
+                "🔐 Rol del Usuario:",
+                ["admin", "gerente", "vendedor"],
+                format_func=lambda x: {
+                    "admin": "🔑 Administrador (Acceso Total)",
+                    "gerente": "👔 Gerente (Acceso Moderado)",
+                    "vendedor": "👤 Vendedor (Acceso Limitado)"
+                }.get(x, x),
+                help="Define el nivel de acceso del usuario"
             )
             
             confirmar_password = st.text_input(
@@ -413,20 +571,15 @@ def mostrar_crear_usuario():
                 help="Debe coincidir con la contraseña anterior"
             )
         
-        nuevo_rol = st.selectbox(
-            "🔐 Rol del Usuario:",
-            ["usuario", "admin"],
-            format_func=lambda x: "🔑 Administrador" if x == "admin" else "👤 Usuario Normal",
-            help="Administrador: acceso completo | Usuario: acceso limitado"
-        )
-        
         st.divider()
         
-        # Mostrar información sobre los roles
-        if nuevo_rol == "admin":
-            st.warning("⚠️ **Rol Administrador:** Tendrá acceso completo a todas las funciones, incluyendo gestión de usuarios")
-        else:
-            st.info("💡 **Rol Usuario:** Acceso a funciones de punto de venta e inventario, sin gestión de usuarios")
+        # Mostrar descripción del rol
+        rol_descriptions = {
+            "admin": "✅ Acceso completo a todos los módulos del sistema",
+            "gerente": "✅ Acceso a: Punto de Venta, Gestión de Productos, Inventario, Pedidos",
+            "vendedor": "✅ Acceso solo a: Punto de Venta e Inventario (lectura)"
+        }
+        st.info(f"📋 **{nuevo_rol.upper()}**: {rol_descriptions.get(nuevo_rol, 'Rol desconocido')}")
         
         submitted = st.form_submit_button("➕ Crear Usuario", type="primary", width='stretch')
 
@@ -439,9 +592,6 @@ def mostrar_crear_usuario():
             
             if ' ' in nuevo_usuario:
                 errores.append("El nombre de usuario no puede contener espacios")
-            
-            if not nuevo_nombre or len(nuevo_nombre.strip()) < 3:
-                errores.append("El nombre completo debe tener al menos 3 caracteres")
             
             if not nuevo_password or len(nuevo_password) < 6:
                 errores.append("La contraseña debe tener al menos 6 caracteres")
@@ -457,12 +607,14 @@ def mostrar_crear_usuario():
                 exito, mensaje = crear_usuario(
                     nuevo_usuario.strip().lower(),
                     nuevo_password,
-                    nuevo_nombre.strip(),
-                    nuevo_rol,
-                    st.session_state.usuario_actual
+                    nuevo_rol
                 )
                 
                 if exito:
+                    # Si el usuario tiene nombre completo, actualizar
+                    if nuevo_nombre.strip():
+                        cambiar_nombre_usuario(nuevo_usuario.strip().lower(), nuevo_nombre.strip())
+                    
                     st.success(f"✅ {mensaje}")
                     st.balloons()
                     
@@ -470,9 +622,9 @@ def mostrar_crear_usuario():
                     st.info(f"""
                     **📋 Resumen del Usuario Creado:**
                     - 👤 Usuario: {nuevo_usuario.strip().lower()}
-                    - 📝 Nombre: {nuevo_nombre.strip()}
-                    - 🔐 Rol: {'🔑 Administrador' if nuevo_rol == 'admin' else '👤 Usuario Normal'}
-                    - 📅 Creado por: {st.session_state.usuario_actual}
+                    - 📝 Nombre: {nuevo_nombre.strip() if nuevo_nombre.strip() else '(Sin especificar)'}
+                    - 🔐 Rol: {nuevo_rol.upper()}
+                    - ✅ Estado: Activo
                     """)
                     
                     import time
@@ -482,7 +634,7 @@ def mostrar_crear_usuario():
                     st.error(f"❌ {mensaje}")
 
 def mostrar_gestionar_usuarios():
-    """Gestionar usuarios existentes: cambiar contraseña, activar/desactivar, eliminar"""
+    """Gestionar usuarios existentes: cambiar contraseña, rol, activar/desactivar, eliminar"""
     st.subheader("🔧 Gestionar Usuarios")
     
     # Obtener lista de usuarios
@@ -495,11 +647,23 @@ def mostrar_gestionar_usuarios():
     # Seleccionar usuario a gestionar
     usuarios_lista = df_usuarios['usuario'].tolist()
     
+    # Mantener el usuario seleccionado en session_state
+    if 'usuario_gestionar_seleccionado' not in st.session_state:
+        st.session_state.usuario_gestionar_seleccionado = usuarios_lista[0] if usuarios_lista else None
+    
+    # Si el usuario seleccionado ya no existe (fue cambiado de nombre), seleccionar el primero
+    if st.session_state.usuario_gestionar_seleccionado not in usuarios_lista:
+        st.session_state.usuario_gestionar_seleccionado = usuarios_lista[0] if usuarios_lista else None
+    
     usuario_seleccionado = st.selectbox(
         "👤 Seleccionar Usuario:",
         usuarios_lista,
-        format_func=lambda x: f"{x} - {df_usuarios[df_usuarios['usuario'] == x]['nombre_completo'].values[0]}"
+        index=usuarios_lista.index(st.session_state.usuario_gestionar_seleccionado) if st.session_state.usuario_gestionar_seleccionado in usuarios_lista else 0,
+        key="selectbox_gestionar_usuarios"
     )
+    
+    # Actualizar el usuario seleccionado en session_state
+    st.session_state.usuario_gestionar_seleccionado = usuario_seleccionado
     
     if usuario_seleccionado:
         # Obtener información del usuario
@@ -507,39 +671,44 @@ def mostrar_gestionar_usuarios():
         
         # Mostrar información del usuario
         st.divider()
-        st.subheader(f"📋 Información de: {info_usuario['nombre_completo']}")
+        st.subheader(f"📋 Información de: {usuario_seleccionado}")
         
         col_info1, col_info2, col_info3 = st.columns(3)
         
         with col_info1:
             st.metric("👤 Usuario", info_usuario['usuario'])
-            st.metric("🔐 Rol", "🔑 Admin" if info_usuario['rol'] == 'admin' else "👤 Usuario")
         
         with col_info2:
-            estado = "✅ Activo" if info_usuario['activo'] == 1 else "❌ Inactivo"
-            st.metric("📊 Estado", estado)
-            fecha_creacion = pd.to_datetime(info_usuario['fecha_creacion']).strftime('%d/%m/%Y')
-            st.metric("📅 Creado", fecha_creacion)
+            rol_map = {
+                'admin': '🔑 Administrador',
+                'gerente': '👔 Gerente',
+                'vendedor': '👤 Vendedor'
+            }
+            st.metric("🔐 Rol", rol_map.get(info_usuario['rol'], info_usuario['rol']))
         
         with col_info3:
-            st.metric("👨‍💼 Creado Por", info_usuario['creado_por'])
-            if pd.notna(info_usuario['ultimo_acceso']):
-                ultimo_acceso = pd.to_datetime(info_usuario['ultimo_acceso']).strftime('%d/%m/%Y')
-                st.metric("🕐 Último Acceso", ultimo_acceso)
-            else:
-                st.metric("🕐 Último Acceso", "Nunca")
+            estado = "✅ Activo" if info_usuario['activo'] == 1 else "❌ Inactivo"
+            st.metric("📊 Estado", estado)
         
         st.divider()
         
         # Tabs para diferentes acciones
-        tab_pass, tab_estado, tab_eliminar = st.tabs([
-            "🔒 **Cambiar Contraseña**",
-            "📊 **Cambiar Estado**",
-            "🗑️ **Eliminar Usuario**"
+        tab_usuario, tab_pass, tab_rol, tab_estado, tab_eliminar = st.tabs([
+            "🔐 **Nombre de Usuario**",
+            "🔒 **Contraseña**",
+            "🔐 **Rol**",
+            "📊 **Estado**",
+            "🗑️ **Eliminar**"
         ])
+        
+        with tab_usuario:
+            mostrar_cambiar_nombre(usuario_seleccionado, info_usuario)
         
         with tab_pass:
             mostrar_cambiar_password(usuario_seleccionado, info_usuario)
+        
+        with tab_rol:
+            mostrar_cambiar_rol(usuario_seleccionado, info_usuario)
         
         with tab_estado:
             mostrar_cambiar_estado(usuario_seleccionado, info_usuario)
@@ -547,9 +716,49 @@ def mostrar_gestionar_usuarios():
         with tab_eliminar:
             mostrar_eliminar_usuario(usuario_seleccionado, info_usuario)
 
+def mostrar_cambiar_nombre(usuario, info_usuario):
+    """Formulario para cambiar nombre de usuario (login)"""
+    st.subheader(f"🔐 Cambiar Nombre de Usuario: {usuario}")
+    
+    st.warning("⚠️ **ADVERTENCIA:** Cambiar el nombre de usuario afectará el login")
+    st.info(f"📌 Nombre de Usuario Actual: **{usuario}**")
+    
+    if usuario == 'admin':
+        st.error("❌ No se puede cambiar el nombre de usuario 'admin' (usuario principal del sistema)")
+        return
+    
+    st.divider()
+    
+    nuevo_usuario = st.text_input(
+        "👤 Nuevo Nombre de Usuario:",
+        placeholder="Ej: jperez",
+        help="Nombre único para iniciar sesión (sin espacios, mínimo 3 caracteres)",
+        key=f"usuario_input_{usuario}"
+    )
+    
+    if st.button("🔄 Cambiar Nombre de Usuario", type="primary", width='stretch', key=f"btn_usuario_{usuario}"):
+        if not nuevo_usuario or len(nuevo_usuario.strip()) < 3:
+            st.error("❌ El nombre de usuario debe tener al menos 3 caracteres")
+        elif ' ' in nuevo_usuario:
+            st.error("❌ El nombre de usuario no puede contener espacios")
+        elif nuevo_usuario.strip() == usuario:
+            st.warning("⚠️ El nuevo nombre de usuario es igual al actual")
+        else:
+            exito, mensaje = cambiar_usuario_login(usuario, nuevo_usuario.strip().lower())
+            if exito:
+                st.success(f"✅ {mensaje}")
+                st.warning(f"💡 Ahora debes iniciar sesión con: **{nuevo_usuario.strip().lower()}**")
+                # Actualizar session_state para mantener el nuevo usuario seleccionado
+                st.session_state.usuario_gestionar_seleccionado = nuevo_usuario.strip().lower()
+                import time
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error(f"❌ {mensaje}")
+
 def mostrar_cambiar_password(usuario, info_usuario):
     """Formulario para cambiar contraseña"""
-    st.subheader(f"🔒 Cambiar Contraseña de: {info_usuario['nombre_completo']}")
+    st.subheader(f"🔒 Cambiar Contraseña: {usuario}")
     
     with st.form(f"form_cambiar_password_{usuario}"):
         nueva_password = st.text_input(
@@ -575,16 +784,62 @@ def mostrar_cambiar_password(usuario, info_usuario):
                 exito, mensaje = actualizar_password(usuario, nueva_password)
                 if exito:
                     st.success(f"✅ {mensaje}")
-                    st.info(f"💡 La contraseña de **{info_usuario['nombre_completo']}** ha sido actualizada")
+                    st.info(f"💡 La contraseña de **{usuario}** ha sido actualizada")
                     import time
                     time.sleep(2)
                     st.rerun()
                 else:
                     st.error(f"❌ {mensaje}")
 
+def mostrar_cambiar_rol(usuario, info_usuario):
+    """Cambiar rol del usuario"""
+    st.subheader(f"🔐 Cambiar Rol: {usuario}")
+    
+    rol_actual = info_usuario['rol']
+    
+    rol_map = {
+        'admin': '🔑 Administrador',
+        'gerente': '👔 Gerente',
+        'vendedor': '👤 Vendedor'
+    }
+    
+    st.info(f"📌 Rol Actual: **{rol_map.get(rol_actual, rol_actual)}**")
+    
+    if usuario == 'admin':
+        st.warning("⚠️ El usuario administrador principal debe mantener su rol")
+        return
+    
+    st.divider()
+    
+    nuevo_rol = st.selectbox(
+        "🔐 Seleccionar nuevo rol:",
+        ["admin", "gerente", "vendedor"],
+        index=["admin", "gerente", "vendedor"].index(rol_actual),
+        format_func=lambda x: rol_map.get(x, x)
+    )
+    
+    if nuevo_rol != rol_actual:
+        rol_descriptions = {
+            "admin": "✅ Acceso completo a todos los módulos",
+            "gerente": "✅ Acceso a: Punto de Venta, Productos, Inventario, Pedidos",
+            "vendedor": "✅ Acceso solo a: Punto de Venta e Inventario (lectura)"
+        }
+        st.info(f"📋 {rol_descriptions.get(nuevo_rol, 'Rol desconocido')}")
+        
+        if st.button("🔄 Cambiar a este Rol", type="primary", width='stretch'):
+            exito, mensaje = cambiar_rol_usuario(usuario, nuevo_rol)
+            if exito:
+                st.success(f"✅ {mensaje}")
+                st.info(f"💡 El rol de **{usuario}** ha sido cambiad a **{rol_map.get(nuevo_rol)}**")
+                import time
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error(f"❌ {mensaje}")
+
 def mostrar_cambiar_estado(usuario, info_usuario):
     """Cambiar estado activo/inactivo del usuario"""
-    st.subheader(f"📊 Cambiar Estado de: {info_usuario['nombre_completo']}")
+    st.subheader(f"📊 Cambiar Estado: {usuario}")
     
     estado_actual = info_usuario['activo'] == 1
     
@@ -624,7 +879,7 @@ def mostrar_cambiar_estado(usuario, info_usuario):
 
 def mostrar_eliminar_usuario(usuario, info_usuario):
     """Eliminar usuario del sistema"""
-    st.subheader(f"🗑️ Eliminar Usuario: {info_usuario['nombre_completo']}")
+    st.subheader(f"🗑️ Eliminar Usuario: {usuario}")
     
     if usuario == 'admin':
         st.error("❌ **No se puede eliminar el usuario administrador principal**")
@@ -632,15 +887,12 @@ def mostrar_eliminar_usuario(usuario, info_usuario):
         return
     
     st.warning("⚠️ **ADVERTENCIA:** Esta acción es IRREVERSIBLE")
-    st.error("❌ Se eliminará permanentemente el usuario y toda su información")
+    st.error("❌ Se eliminará permanentemente el usuario del sistema")
     
     st.divider()
     
     st.write("**📋 Datos que se eliminarán:**")
-    st.write(f"- 👤 Usuario: **{info_usuario['usuario']}**")
-    st.write(f"- 📝 Nombre: **{info_usuario['nombre_completo']}**")
-    st.write(f"- 🔐 Rol: **{info_usuario['rol']}**")
-    st.write(f"- 📅 Creado: **{pd.to_datetime(info_usuario['fecha_creacion']).strftime('%d/%m/%Y')}**")
+    st.write(f"- 👤 Usuario: **{usuario}**")
     
     st.divider()
     
@@ -652,12 +904,12 @@ def mostrar_eliminar_usuario(usuario, info_usuario):
     
     if st.button("🗑️ ELIMINAR USUARIO", type="secondary", width='stretch'):
         if confirmacion != usuario:
-            st.error(f"❌ Debe escribir exactamente '{usuario}' para confirmar la eliminación")
+            st.error(f"❌ Debe escribir exactamente '{usuario}' para confirmar")
         else:
             exito, mensaje = eliminar_usuario(usuario)
             if exito:
                 st.success(f"✅ {mensaje}")
-                st.info(f"💡 El usuario **{info_usuario['nombre_completo']}** ha sido eliminado del sistema")
+                st.info(f"💡 El usuario **{usuario}** ha sido eliminado del sistema")
                 import time
                 time.sleep(2)
                 st.rerun()

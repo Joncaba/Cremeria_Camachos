@@ -182,20 +182,20 @@ def obtener_productos_stock_bajo():
         SELECT codigo, nombre, stock, stock_minimo, stock_maximo, stock_kg, stock_minimo_kg, 
                stock_maximo_kg, tipo_venta, categoria,
                CASE 
-                   WHEN tipo_venta = 'granel' THEN 
+                   WHEN tipo_venta IN ('granel', 'kg') THEN 
                        CASE WHEN stock_maximo_kg > 0 THEN (stock_kg * 100.0 / stock_maximo_kg) ELSE 100 END
                    ELSE 
                        CASE WHEN stock_maximo > 0 THEN (stock * 100.0 / stock_maximo) ELSE 100 END
                END as porcentaje_stock,
                CASE 
-                   WHEN tipo_venta = 'granel' THEN (stock_maximo_kg - stock_kg)
+                   WHEN tipo_venta IN ('granel', 'kg') THEN (stock_maximo_kg - stock_kg)
                    ELSE (stock_maximo - stock)
                END as cantidad_necesaria,
                precio_compra, precio_normal, precio_por_kg
         FROM productos 
         WHERE (
             (tipo_venta = 'unidad' AND stock <= stock_minimo AND stock_minimo > 0) OR
-            (tipo_venta = 'granel' AND stock_kg <= stock_minimo_kg AND stock_minimo_kg > 0)
+            (tipo_venta IN ('granel', 'kg') AND stock_kg <= stock_minimo_kg AND stock_minimo_kg > 0)
         )
         ORDER BY categoria, porcentaje_stock ASC
         """
@@ -205,15 +205,15 @@ def obtener_productos_stock_bajo():
         # Agregar columnas display unificadas
         if not productos_bajo_stock.empty:
             productos_bajo_stock['stock_display'] = productos_bajo_stock.apply(
-                lambda row: f"{row['stock_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{int(row['stock'])} unid.",
+                lambda row: f"{row['stock_kg']:.2f} kg" if row['tipo_venta'] in ['granel', 'kg'] else f"{int(row['stock'])} unid.",
                 axis=1
             )
             productos_bajo_stock['stock_minimo_display'] = productos_bajo_stock.apply(
-                lambda row: f"{row['stock_minimo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{int(row['stock_minimo'])} unid.",
+                lambda row: f"{row['stock_minimo_kg']:.2f} kg" if row['tipo_venta'] in ['granel', 'kg'] else f"{int(row['stock_minimo'])} unid.",
                 axis=1
             )
             productos_bajo_stock['stock_maximo_display'] = productos_bajo_stock.apply(
-                lambda row: f"{row['stock_maximo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{int(row['stock_maximo'])} unid.",
+                lambda row: f"{row['stock_maximo_kg']:.2f} kg" if row['tipo_venta'] in ['granel', 'kg'] else f"{int(row['stock_maximo'])} unid.",
                 axis=1
             )
         
@@ -453,13 +453,14 @@ def mostrar_alertas_stock():
         <h3>🚨 ALERTA: PRODUCTOS CON STOCK BAJO 🚨</h3>
         <p>Hay <strong>{}</strong> productos que necesitan reabastecimiento urgente</p>
         </div>
-        """.format(len(productos_bajo_stock)), unsafe_allow_html=True)
+        """.format(len(productos_bajo_stock)), unsafe_allow_html=True) 
         
         # Mostrar tabla de productos críticos
         st.dataframe(
             productos_bajo_stock,
             column_config={
-                "codigo": "Código",
+                "codigo": "🏷️ Código",
+                "numero_producto": st.column_config.NumberColumn("🔢 PLU", format="%d", width="small"),
                 "nombre": "Producto",
                 "tipo_venta": None,
                 "stock": None,
@@ -525,7 +526,7 @@ def exportar_a_excel(productos_df, productos_bajo_stock_df):
             resumen_compras = productos_bajo_stock_df.copy()
             resumen_compras['inversion_necesaria'] = resumen_compras['cantidad_necesaria'] * resumen_compras['precio_compra']
             resumen_compras['valor_venta_potencial'] = resumen_compras.apply(
-                lambda row: row['cantidad_necesaria'] * (row['precio_por_kg'] if row['tipo_venta'] == 'granel' else row['precio_normal']), 
+                lambda row: row['cantidad_necesaria'] * (row['precio_por_kg'] if row['tipo_venta'] in ['granel', 'kg'] else row['precio_normal']), 
                 axis=1
             )
             resumen_compras['ganancia_potencial'] = resumen_compras['valor_venta_potencial'] - resumen_compras['inversion_necesaria']
@@ -543,7 +544,7 @@ def exportar_a_excel(productos_df, productos_bajo_stock_df):
                 'Valor': [
                     len(productos_bajo_stock_df),
                     len(productos_bajo_stock_df[productos_bajo_stock_df['tipo_venta'] == 'unidad']),
-                    len(productos_bajo_stock_df[productos_bajo_stock_df['tipo_venta'] == 'granel']),
+                    len(productos_bajo_stock_df[productos_bajo_stock_df['tipo_venta'].isin(['granel', 'kg'])]),
                     f"${resumen_compras['inversion_necesaria'].sum():.2f}",
                     f"${resumen_compras['valor_venta_potencial'].sum():.2f}",
                     f"${resumen_compras['ganancia_potencial'].sum():.2f}"
@@ -556,7 +557,7 @@ def exportar_a_excel(productos_df, productos_bajo_stock_df):
             lista_compras = productos_bajo_stock_df[['codigo', 'nombre', 'tipo_venta', 'cantidad_necesaria', 'precio_compra']].copy()
             lista_compras['inversion_necesaria'] = lista_compras['cantidad_necesaria'] * lista_compras['precio_compra']
             lista_compras['unidad'] = lista_compras.apply(
-                lambda row: 'Kg' if row['tipo_venta'] == 'granel' else 'Unidades', axis=1
+                lambda row: 'Kg' if row['tipo_venta'] in ['granel', 'kg'] else 'Unidades', axis=1
             )
             lista_compras = lista_compras.rename(columns={
                 'codigo': 'Código',
@@ -601,11 +602,11 @@ def exportar_a_excel(productos_df, productos_bajo_stock_df):
     output.seek(0)
     return output
 
-def mostrar():
+def mostrar(modo_lectura=False):
     st.title("📦 Gestión de Inventario")
     
     # === CONTROL DE ACCESO ADMINISTRATIVO ===
-    es_admin = verificar_sesion_admin()
+    es_admin = verificar_sesion_admin() and not modo_lectura
     
     # Mostrar estado de sesión y controles
     col_header1, col_header2 = st.columns([3, 1])
@@ -613,10 +614,11 @@ def mostrar():
     with col_header1:
         if es_admin:
             # Obtener tiempo restante usando función centralizada
-            horas_restantes, minutos_restantes = obtener_tiempo_restante()
-            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | Sesión: {horas_restantes}h {minutos_restantes}m restantes")
+            tiempo_restante = obtener_tiempo_restante()
+            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | {tiempo_restante}")
         else:
-            st.info("👀 **Modo Solo Lectura** - Inventario en modo consulta. Configuraciones restringidas.")
+            usuario = st.session_state.get('usuario_admin', 'Usuario')
+            st.info(f"👀 **Modo Solo Lectura** - Usuario: {usuario} | Inventario en modo consulta. Configuraciones restringidas.")
     
     with col_header2:
         if es_admin:
@@ -681,14 +683,14 @@ def mostrar():
         
         # Agregar columnas de análisis
         def calcular_estado_stock(row):
-            if row.get('tipo_venta', 'unidad') == 'granel':
-                stock_actual = row.get('stock_kg', 0)
-                stock_min = row.get('stock_minimo_kg', 0)
-                stock_max = row.get('stock_maximo_kg', 0)
+            if row.get('tipo_venta', 'unidad') in ['granel', 'kg']:
+                stock_actual = float(row.get('stock_kg', 0) or 0)
+                stock_min = float(row.get('stock_minimo_kg', 0) or 0)
+                stock_max = float(row.get('stock_maximo_kg', 0) or 0)
             else:
-                stock_actual = row.get('stock', 0)
-                stock_min = row.get('stock_minimo', 10)
-                stock_max = row.get('stock_maximo', 0)
+                stock_actual = float(row.get('stock', 0) or 0)
+                stock_min = float(row.get('stock_minimo', 10) or 10)
+                stock_max = float(row.get('stock_maximo', 0) or 0)
             
             if stock_max > 0:
                 porcentaje = (stock_actual / stock_max) * 100
@@ -708,12 +710,12 @@ def mostrar():
             return '🟢 NORMAL'
 
         def calcular_porcentaje_stock(row):
-            if row.get('tipo_venta', 'unidad') == 'granel':
-                stock_actual = row.get('stock_kg', 0)
-                stock_max = row.get('stock_maximo_kg', 0)
+            if row.get('tipo_venta', 'unidad') in ['granel', 'kg']:
+                stock_actual = float(row.get('stock_kg', 0) or 0)
+                stock_max = float(row.get('stock_maximo_kg', 0) or 0)
             else:
-                stock_actual = row.get('stock', 0)
-                stock_max = row.get('stock_maximo', 0)
+                stock_actual = float(row.get('stock', 0) or 0)
+                stock_max = float(row.get('stock_maximo', 0) or 0)
 
             if stock_max > 0:
                 return ((stock_actual / stock_max) * 100)
@@ -783,28 +785,28 @@ def mostrar():
         
         # Agregar columnas calculadas para mejor visualización
         df_filtrado['stock_display'] = df_filtrado.apply(
-            lambda row: f"{row['stock_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{row['stock']} unid.",
+            lambda row: f"{row['stock_kg']:.2f} kg" if row['tipo_venta'] in ['granel', 'kg'] else f"{row['stock']} unid.",
             axis=1
         )
         
         df_filtrado['stock_minimo_display'] = df_filtrado.apply(
-            lambda row: f"{row['stock_minimo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{row['stock_minimo']} unid.",
+            lambda row: f"{row['stock_minimo_kg']:.2f} kg" if row['tipo_venta'] in ['granel', 'kg'] else f"{row['stock_minimo']} unid.",
             axis=1
         )
         
         df_filtrado['stock_maximo_display'] = df_filtrado.apply(
-            lambda row: f"{row['stock_maximo_kg']:.2f} kg" if row['tipo_venta'] == 'granel' else f"{row['stock_maximo']} unid.",
+            lambda row: f"{row['stock_maximo_kg']:.2f} kg" if row['tipo_venta'] in ['granel', 'kg'] else f"{row['stock_maximo']} unid.",
             axis=1
         )
         
         # Crear columnas editables unificadas que muestran el valor correcto según tipo de venta
         df_filtrado['stock_minimo_editable'] = df_filtrado.apply(
-            lambda row: row['stock_minimo_kg'] if row['tipo_venta'] == 'granel' else float(row['stock_minimo']),
+            lambda row: row['stock_minimo_kg'] if row['tipo_venta'] in ['granel', 'kg'] else float(row['stock_minimo']),
             axis=1
         )
         
         df_filtrado['stock_maximo_editable'] = df_filtrado.apply(
-            lambda row: row['stock_maximo_kg'] if row['tipo_venta'] == 'granel' else float(row['stock_maximo']),
+            lambda row: row['stock_maximo_kg'] if row['tipo_venta'] in ['granel', 'kg'] else float(row['stock_maximo']),
             axis=1
         )
         
@@ -818,8 +820,9 @@ def mostrar():
         # Formatear tipo de venta con iconos
         df_filtrado['tipo_display'] = df_filtrado['tipo_venta'].map({
             'unidad': '🏷️ Unidad',
-            'granel': '⚖️ Granel'
-        })
+            'granel': '⚖️ Granel',
+            'kg': '⚖️ Granel'
+        }).fillna('🏷️ Unidad')
         
         # Tabla unificada con edición para admins o solo lectura para usuarios
         if es_admin:
@@ -828,7 +831,7 @@ def mostrar():
             
             # Preparar DataFrame editable con todas las columnas visibles
             df_editable = df_filtrado[[
-                'codigo', 'nombre', 'categoria_display', 'tipo_display', 'tipo_venta',
+                'codigo', 'numero_producto', 'nombre', 'categoria_display', 'tipo_display', 'tipo_venta',
                 'precio_normal', 'precio_compra', 'stock_display',
                 'stock_minimo_editable', 'stock_maximo_editable',
                 'porcentaje_stock', 'estado_stock',
@@ -839,7 +842,8 @@ def mostrar():
             edited_df = st.data_editor(
                 df_editable,
                 column_config={
-                    "codigo": st.column_config.TextColumn("Código", disabled=True, width="small"),
+                    "codigo": st.column_config.TextColumn("🏷️ Código", disabled=True, width="small"),
+                    "numero_producto": st.column_config.NumberColumn("🔢 PLU", format="%d", disabled=True, width="small"),
                     "nombre": st.column_config.TextColumn("📝 Producto", width="medium"),
                     "categoria_display": st.column_config.TextColumn("🏪 Categoría", disabled=True, width="small"),
                     "tipo_display": st.column_config.TextColumn("Tipo", disabled=True, width="small"),
@@ -912,13 +916,13 @@ def mostrar():
                         
                         # Detectar cambios en stock mínimo y máximo según tipo de venta
                         if stock_minimo_editable_nuevo != original['stock_minimo_editable']:
-                            if tipo_venta == 'granel':
+                            if tipo_venta in ['granel', 'kg']:
                                 cambios.append(("stock_minimo_kg", stock_minimo_editable_nuevo))
                             else:
                                 cambios.append(("stock_minimo", int(stock_minimo_editable_nuevo)))
                         
                         if stock_maximo_editable_nuevo != original['stock_maximo_editable']:
-                            if tipo_venta == 'granel':
+                            if tipo_venta in ['granel', 'kg']:
                                 cambios.append(("stock_maximo_kg", stock_maximo_editable_nuevo))
                             else:
                                 cambios.append(("stock_maximo", int(stock_maximo_editable_nuevo)))
@@ -983,7 +987,11 @@ def mostrar():
                                 st.success(f"☁️ Todos los cambios sincronizados con Supabase ({productos_sincronizados}/{cambios_realizados})")
                             else:
                                 st.warning(f"⚠️ Sincronizados {productos_sincronizados} de {cambios_realizados} productos con Supabase")
-                        
+
+                        # Limpiar cualquier caché antes del rerun
+                        if 'productos_bajo_stock_cache' in st.session_state:
+                            del st.session_state.productos_bajo_stock_cache
+
                         time.sleep(1.5)
                         st.rerun()
                     
@@ -1000,7 +1008,7 @@ def mostrar():
             st.markdown("### 📊 Vista del Inventario")
             
             df_display = df_filtrado[[
-                'codigo', 'nombre', 'categoria_display', 'tipo_display',
+                'codigo', 'numero_producto', 'nombre', 'categoria_display', 'tipo_display',
                 'precio_normal', 'stock_display', 'stock_minimo_display', 'stock_maximo_display',
                 'porcentaje_stock', 'estado_stock',
                 'precio_mayoreo_1', 'precio_mayoreo_2', 'precio_mayoreo_3',
@@ -1009,7 +1017,8 @@ def mostrar():
             
             # Configuración de columnas para vista de solo lectura
             column_config = {
-                "codigo": st.column_config.TextColumn("Código", width="small"),
+                "codigo": st.column_config.TextColumn("🏷️ Código", width="small"),
+                "numero_producto": st.column_config.NumberColumn("🔢 PLU", format="%d", width="small"),
                 "nombre": st.column_config.TextColumn("Producto", width="medium"),
                 "categoria_display": st.column_config.TextColumn("🏪 Categoría", width="small"),
                 "tipo_display": st.column_config.TextColumn("Tipo", width="small"),
@@ -1069,7 +1078,7 @@ def mostrar():
             if 'estado_stock' in productos_df.columns:
                 # Calcular estado del stock para el gráfico
                 def calcular_estado_stock(row):
-                    if row.get('tipo_venta', 'unidad') == 'granel':
+                    if row.get('tipo_venta', 'unidad') in ['granel', 'kg']:
                         stock_actual = row.get('stock_kg', 0)
                         stock_min = row.get('stock_minimo_kg', 0)
                     else:
@@ -1201,7 +1210,7 @@ def mostrar():
                         cursor.execute("""
                             SELECT codigo, nombre, precio_normal as precio_venta, precio_compra, stock, 
                                    stock_minimo, codigo as codigo_barras, 
-                                   CASE WHEN tipo_venta = 'granel' THEN 1 ELSE 0 END as es_granel,
+                                   CASE WHEN tipo_venta IN ('granel', 'kg') THEN 1 ELSE 0 END as es_granel,
                                    'General' as categoria, stock_maximo, stock_kg, stock_minimo_kg, stock_maximo_kg
                             FROM productos 
                             WHERE LOWER(nombre) LIKE LOWER(?) OR LOWER(nombre) = LOWER(?)
@@ -1635,31 +1644,135 @@ def mostrar():
     # Separador
     st.divider()
     
-    # 5. Métricas importantes
-    st.subheader("📈 Métricas del Inventario")
+    # 5. Métricas importantes - Resumen General del Inventario
+    st.subheader("📦 Resumen General de Inventario")
+    
+    # Calcular métricas principales
+    total_productos = len(productos_df) if not productos_df.empty else 0
+    productos_criticos = len(productos_bajo_stock) if not productos_bajo_stock.empty else 0
+    
+    # Valor total del inventario actual (stock actual × precio normal como referencia)
+    if not productos_df.empty:
+        # Asegurar que todos los campos numéricos sean del tipo correcto
+        productos_df['precio_normal'] = pd.to_numeric(productos_df['precio_normal'], errors='coerce').fillna(0)
+        productos_df['stock'] = pd.to_numeric(productos_df['stock'], errors='coerce').fillna(0)
+        productos_df['stock_kg'] = pd.to_numeric(productos_df['stock_kg'], errors='coerce').fillna(0)
+        productos_df['stock_maximo'] = pd.to_numeric(productos_df['stock_maximo'], errors='coerce').fillna(0)
+        productos_df['stock_maximo_kg'] = pd.to_numeric(productos_df['stock_maximo_kg'], errors='coerce').fillna(0)
+        
+        # Calcular valor considerando productos por unidad y por granel
+        # Usar precio_normal como referencia de valor ya que precio_compra está vacío
+        productos_df['valor_actual'] = productos_df.apply(
+            lambda row: (float(row['stock_kg']) * float(row['precio_normal'])) if row['tipo_venta'] in ['granel', 'kg'] 
+                       else (float(row['stock']) * float(row['precio_normal'])),
+            axis=1
+        )
+        valor_inventario_actual = productos_df['valor_actual'].sum()
+    else:
+        valor_inventario_actual = 0.0
+    
+    # Inversión necesaria para reabastecer productos con stock bajo
+    if not productos_bajo_stock.empty:
+        productos_bajo_stock_copy = productos_bajo_stock.copy()
+        productos_bajo_stock_copy['cantidad_necesaria'] = pd.to_numeric(productos_bajo_stock_copy['cantidad_necesaria'], errors='coerce').fillna(0)
+        productos_bajo_stock_copy['precio_normal'] = pd.to_numeric(productos_bajo_stock_copy['precio_normal'], errors='coerce').fillna(0)
+        inversion_reabastecimiento = (productos_bajo_stock_copy['cantidad_necesaria'] * productos_bajo_stock_copy['precio_normal']).sum()
+    else:
+        inversion_reabastecimiento = 0.0
+    
+    # Ganancia total si se vende todo el inventario actual
+    # Ganancia = (precio_normal - precio_compra) × cantidad_actual
+    if not productos_df.empty:
+        productos_df['precio_compra'] = pd.to_numeric(productos_df['precio_compra'], errors='coerce').fillna(0)
+        productos_df['ganancia_unitaria'] = productos_df['precio_normal'] - productos_df['precio_compra']
+        productos_df['ganancia_total'] = productos_df.apply(
+            lambda row: (float(row['stock_kg']) * float(row['ganancia_unitaria'])) if row['tipo_venta'] in ['granel', 'kg'] 
+                       else (float(row['stock']) * float(row['ganancia_unitaria'])),
+            axis=1
+        )
+        ganancia_inventario_actual = productos_df['ganancia_total'].sum()
+    else:
+        ganancia_inventario_actual = 0.0
+    
+    # Mostrar métricas en columnas
     col_met1, col_met2, col_met3, col_met4 = st.columns(4)
     
     with col_met1:
-        total_productos = len(productos_df)
-        st.metric("Total Productos", total_productos)
+        st.metric(
+            "📦 Total de Productos", 
+            total_productos,
+            help="Cantidad total de productos únicos en el inventario"
+        )
     
     with col_met2:
-        productos_criticos = len(productos_bajo_stock)
-        st.metric("Productos Críticos", productos_criticos, delta=f"-{productos_criticos}" if productos_criticos > 0 else None)
+        # Mostrar con mejor formato
+        valor_formateado = f"${valor_inventario_actual:,.2f}"
+        st.metric(
+            "💰 Valor del Inventario Actual", 
+            valor_formateado,
+            help="Valor total del stock actual (cantidad actual × precio de compra)"
+        )
     
     with col_met3:
-        if not productos_df.empty:
-            valor_inventario = (productos_df['stock'] * productos_df['precio_compra']).sum()
-            st.metric("Valor Inventario", f"${valor_inventario:.2f}")
-        else:
-            st.metric("Valor Inventario", "$0.00")
+        st.metric(
+            "🛒 Inversión para Reabastecer", 
+            f"${inversion_reabastecimiento:,.2f}",
+            delta=f"{productos_criticos} productos" if productos_criticos > 0 else "0 productos",
+            delta_color="inverse" if productos_criticos > 0 else "off",
+            help="Inversión necesaria para llevar productos con stock bajo hasta su stock máximo"
+        )
     
     with col_met4:
-        if not productos_bajo_stock.empty:
-            inversion_necesaria = (productos_bajo_stock['cantidad_necesaria'] * productos_bajo_stock['precio_compra']).sum()
-            st.metric("Inversión Necesaria", f"${inversion_necesaria:.2f}")
-        else:
-            st.metric("Inversión Necesaria", "$0.00")
+        st.metric(
+            "💵 Ganancia Potencial", 
+            f"${ganancia_inventario_actual:,.2f}",
+            help="Ganancia total si se vende todo el inventario actual al precio normal"
+        )
+    
+    # Resumen adicional con más detalles
+    st.markdown("---")
+    
+    # Calcular valor máximo potencial para mostrar en detalles
+    if not productos_df.empty:
+        productos_df['valor_maximo'] = productos_df.apply(
+            lambda row: (float(row['stock_maximo_kg']) * float(row['precio_normal'])) if row['tipo_venta'] in ['granel', 'kg'] 
+                       else (float(row['stock_maximo']) * float(row['precio_normal'])),
+            axis=1
+        )
+        valor_inventario_maximo = productos_df['valor_maximo'].sum()
+    else:
+        valor_inventario_maximo = 0.0
+    
+    col_detalle1, col_detalle2, col_detalle3 = st.columns(3)
+    
+    with col_detalle1:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.2rem; border-radius: 12px; color: white;">
+            <h4 style="margin: 0; color: white;">📊 Estado del Inventario</h4>
+            <p style="font-size: 1.1rem; margin: 0.5rem 0;"><strong>Productos con Stock Bajo:</strong> {}</p>
+            <p style="font-size: 0.9rem; margin: 0;">Productos que necesitan reabastecimiento urgente</p>
+        </div>
+        """.format(productos_criticos), unsafe_allow_html=True)
+    
+    with col_detalle2:
+        porcentaje_llenado = (valor_inventario_actual / valor_inventario_maximo * 100) if valor_inventario_maximo > 0 else 0
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); padding: 1.2rem; border-radius: 12px; color: white;">
+            <h4 style="margin: 0; color: white;">📈 Capacidad del Inventario</h4>
+            <p style="font-size: 1.1rem; margin: 0.5rem 0;"><strong>{:.1f}%</strong> de capacidad utilizada</p>
+            <p style="font-size: 0.9rem; margin: 0;">Espacio disponible para crecimiento</p>
+        </div>
+        """.format(porcentaje_llenado), unsafe_allow_html=True)
+    
+    with col_detalle3:
+        valor_necesario_total = valor_inventario_maximo - valor_inventario_actual
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); padding: 1.2rem; border-radius: 12px; color: white;">
+            <h4 style="margin: 0; color: white;">💵 Inversión Total Faltante</h4>
+            <p style="font-size: 1.1rem; margin: 0.5rem 0;"><strong>${:,.2f}</strong></p>
+            <p style="font-size: 0.9rem; margin: 0;">Para completar inventario al 100%</p>
+        </div>
+        """.format(valor_necesario_total), unsafe_allow_html=True)
     
     # Separador
     st.divider()

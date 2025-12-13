@@ -695,7 +695,7 @@ def mostrar_ordenes_compra():
                         productos_query = """
                             SELECT 
                                 nombre_producto, 
-                                cantidad_solicitada as cantidad, 
+                                cantidad_recibida as cantidad, 
                                 precio_unitario, 
                                 subtotal,
                                 proveedor
@@ -1384,27 +1384,59 @@ def mostrar_resumen_general():
         
         with col_inv2:
             try:
-                valor_inventario = (productos_df['stock'] * productos_df['precio_compra']).sum()
-                st.metric("💰 Valor Inventario", f"${valor_inventario:,.2f}")
+                # Asegurar que todos los campos numéricos sean del tipo correcto
+                productos_df['precio_normal'] = pd.to_numeric(productos_df['precio_normal'], errors='coerce').fillna(0)
+                productos_df['stock'] = pd.to_numeric(productos_df['stock'], errors='coerce').fillna(0)
+                productos_df['stock_kg'] = pd.to_numeric(productos_df['stock_kg'], errors='coerce').fillna(0)
+                
+                # Calcular valor considerando productos por unidad y por granel
+                productos_df['valor_actual'] = productos_df.apply(
+                    lambda row: (float(row['stock_kg']) * float(row['precio_normal'])) if row['tipo_venta'] in ['granel', 'kg'] 
+                               else (float(row['stock']) * float(row['precio_normal'])),
+                    axis=1
+                )
+                valor_inventario = productos_df['valor_actual'].sum()
+                st.metric("💰 Valor Inventario", f"${valor_inventario:,.2f}", 
+                         help="Valor total del stock actual (cantidad × precio de venta)")
             except:
                 st.metric("💰 Valor Inventario", "N/A")
         
         with col_inv3:
             try:
-                productos_bajo_stock = len(productos_df[productos_df['stock'] <= 10])
-                st.metric("⚠️ Stock Bajo", productos_bajo_stock)
+                # Asegurar conversión de tipos para stock_minimo
+                productos_df['stock_minimo'] = pd.to_numeric(productos_df['stock_minimo'], errors='coerce').fillna(0)
+                productos_df['stock_minimo_kg'] = pd.to_numeric(productos_df['stock_minimo_kg'], errors='coerce').fillna(0)
+                
+                # Contar productos con stock bajo según su tipo de venta
+                productos_bajo_stock = len(productos_df[
+                    ((productos_df['tipo_venta'] == 'unidad') & (productos_df['stock'] <= productos_df['stock_minimo']) & (productos_df['stock_minimo'] > 0)) |
+                    ((productos_df['tipo_venta'].isin(['granel', 'kg'])) & (productos_df['stock_kg'] <= productos_df['stock_minimo_kg']) & (productos_df['stock_minimo_kg'] > 0))
+                ])
+                st.metric("⚠️ Stock Bajo", productos_bajo_stock, 
+                         help="Productos con stock actual menor o igual al stock mínimo configurado")
             except:
                 st.metric("⚠️ Stock Bajo", "N/A")
         
         with col_inv4:
             try:
-                if 'tipo_venta' in productos_df.columns:
-                    productos_granel = len(productos_df[productos_df['tipo_venta'] == 'granel'])
-                    st.metric("⚖️ Productos a Granel", productos_granel)
-                else:
-                    st.metric("⚖️ Productos a Granel", "N/A")
+                # Calcular ganancia potencial si se vende todo el inventario actual
+                # Ganancia = (precio_normal - precio_compra) × cantidad_actual
+                productos_df['precio_compra'] = pd.to_numeric(productos_df['precio_compra'], errors='coerce').fillna(0)
+                productos_df['precio_normal'] = pd.to_numeric(productos_df['precio_normal'], errors='coerce').fillna(0)
+                productos_df['stock'] = pd.to_numeric(productos_df['stock'], errors='coerce').fillna(0)
+                productos_df['stock_kg'] = pd.to_numeric(productos_df['stock_kg'], errors='coerce').fillna(0)
+                
+                productos_df['ganancia_unitaria'] = productos_df['precio_normal'] - productos_df['precio_compra']
+                productos_df['ganancia_total'] = productos_df.apply(
+                    lambda row: (float(row['stock_kg']) * float(row['ganancia_unitaria'])) if row['tipo_venta'] in ['granel', 'kg'] 
+                               else (float(row['stock']) * float(row['ganancia_unitaria'])),
+                    axis=1
+                )
+                ganancia_inventario = productos_df['ganancia_total'].sum()
+                st.metric("💵 Ganancia Potencial", f"${ganancia_inventario:,.2f}", 
+                         help="Ganancia total si se vende todo el inventario actual")
             except:
-                st.metric("⚖️ Productos a Granel", "N/A")
+                st.metric("💵 Ganancia Potencial", "N/A")
 
 def mostrar_ventas_por_dia():
     st.subheader("🗓️ Ventas por Día")

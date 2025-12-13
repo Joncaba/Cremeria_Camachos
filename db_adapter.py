@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 # Detectar qué base de datos usar
-USE_SUPABASE = os.getenv('USE_SUPABASE', 'true').lower() == 'true'
+USE_SUPABASE = os.getenv('USE_SUPABASE', 'false').lower() == 'true'
 
 if USE_SUPABASE:
     try:
@@ -238,9 +238,18 @@ class DatabaseAdapter:
         else:
             conn = self._get_sqlite_conn()
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM usuarios_admin WHERE usuario = ?", (usuario,))
+            cursor.execute("SELECT id, usuario, password, activo, rol FROM usuarios WHERE usuario = ?", (usuario,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if row:
+                # Convertir sqlite3.Row a diccionario
+                return {
+                    'id': row[0],
+                    'usuario': row[1],
+                    'password': row[2],
+                    'activo': row[3],
+                    'rol': row[4]
+                }
+            return None
     
     def insertar_usuario(self, usuario: Dict) -> bool:
         """Crear un nuevo usuario"""

@@ -241,33 +241,51 @@ def obtener_productos_bajo_stock():
            stock_maximo, stock_maximo_kg, tipo_venta,
            precio_compra, precio_normal, precio_por_kg, categoria,
            CASE 
-               WHEN tipo_venta = 'granel' THEN 
+               WHEN tipo_venta IN ('granel', 'kg') THEN 
                    CASE WHEN stock_maximo_kg > 0 THEN CAST((stock_kg * 100.0 / stock_maximo_kg) AS INTEGER) ELSE 100 END
                ELSE 
                    CASE WHEN stock_maximo > 0 THEN CAST((stock * 100.0 / stock_maximo) AS INTEGER) ELSE 100 END
            END as porcentaje_stock,
            CASE 
-               WHEN tipo_venta = 'granel' THEN 
+               WHEN tipo_venta IN ('granel', 'kg') THEN 
                    CASE 
-                       WHEN stock_maximo_kg > 0 THEN ROUND(MAX(stock_maximo_kg - stock_kg, 1.0), 2)
-                       ELSE ROUND(MAX(stock_minimo_kg * 3.0, 5.0), 2)
+                       WHEN stock_minimo_kg > 0 AND stock_minimo_kg > stock_kg 
+                           THEN ROUND(stock_minimo_kg - stock_kg, 2)
+                       WHEN stock_minimo_kg > 0 AND stock_minimo_kg <= stock_kg 
+                           THEN 0.0
+                       ELSE ROUND(CASE WHEN stock_minimo_kg * 2.0 > 3.0 THEN stock_minimo_kg * 2.0 ELSE 3.0 END, 2)
                    END
                ELSE 
                    CASE 
-                       WHEN stock_maximo > 0 THEN MAX(stock_maximo - stock, 1)
-                       ELSE MAX(stock_minimo * 3, 10)
+                       WHEN stock_minimo > 0 AND stock_minimo > stock 
+                           THEN stock_minimo - stock
+                       WHEN stock_minimo > 0 AND stock_minimo <= stock 
+                           THEN 0
+                       ELSE CASE WHEN stock_minimo * 2 > 5 THEN stock_minimo * 2 ELSE 5 END
                    END
            END as cantidad_necesaria,
            CASE 
-               WHEN tipo_venta = 'granel' THEN 
-                   ROUND(CASE WHEN stock_maximo_kg > 0 THEN MAX(stock_maximo_kg - stock_kg, 1.0) ELSE MAX(stock_minimo_kg * 3.0, 5.0) END, 2)
+               WHEN tipo_venta IN ('granel', 'kg') THEN 
+                   CASE 
+                       WHEN stock_maximo_kg > 0 AND stock_maximo_kg > stock_kg 
+                           THEN ROUND(stock_maximo_kg - stock_kg, 2)
+                       WHEN stock_maximo_kg > 0 AND stock_maximo_kg <= stock_kg 
+                           THEN 0.0
+                       ELSE ROUND(CASE WHEN stock_minimo_kg * 3.0 > 5.0 THEN stock_minimo_kg * 3.0 ELSE 5.0 END, 2)
+                   END
                ELSE 
-                   CASE WHEN stock_maximo > 0 THEN MAX(stock_maximo - stock, 1) ELSE MAX(stock_minimo * 3, 10) END
+                   CASE 
+                       WHEN stock_maximo > 0 AND stock_maximo > stock 
+                           THEN stock_maximo - stock
+                       WHEN stock_maximo > 0 AND stock_maximo <= stock 
+                           THEN 0
+                       ELSE CASE WHEN stock_minimo * 3 > 10 THEN stock_minimo * 3 ELSE 10 END
+                   END
            END as cantidad_hasta_maximo
     FROM productos 
     WHERE (
         (tipo_venta = 'unidad' AND stock <= stock_minimo AND stock_minimo > 0) OR
-        (tipo_venta = 'granel' AND stock_kg <= stock_minimo_kg AND stock_minimo_kg > 0)
+        (tipo_venta IN ('granel', 'kg') AND stock_kg <= stock_minimo_kg AND stock_minimo_kg > 0)
     )
     ORDER BY categoria, porcentaje_stock ASC
     """
@@ -366,15 +384,54 @@ def obtener_pedidos_activos():
     conn.close()
     return pedidos
 
+
+def recalcular_totales_pedidos():
+    """Recalcular totales y conteos de productos de todos los pedidos desde los items"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id FROM pedidos")
+        pedidos_ids = [row[0] for row in cursor.fetchall()]
+
+        for pid in pedidos_ids:
+            cursor.execute(
+                """
+                SELECT 
+                    COALESCE(SUM(subtotal), 0) as total_costo,
+                    COALESCE(SUM(CASE WHEN cantidad_recibida > 0 THEN 1 ELSE 0 END), 0) as total_productos
+                FROM pedidos_items
+                WHERE pedido_id = ?
+                """,
+                (pid,)
+            )
+            total_costo, total_productos = cursor.fetchone()
+
+            cursor.execute(
+                """
+                UPDATE pedidos
+                SET total_costo = ?, total_productos = ?
+                WHERE id = ?
+                """,
+                (total_costo or 0, total_productos or 0, pid)
+            )
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error al recalcular totales de pedidos: {e}")
+    finally:
+        conn.close()
+
 def obtener_items_pedido(pedido_id):
     """Obtener los items/productos de un pedido específico"""
     conn = sqlite3.connect(DB_PATH)
     query = """
-    SELECT id, codigo_producto, nombre_producto, cantidad_solicitada, cantidad_recibida,
-           precio_unitario, subtotal, proveedor, estado_item
-    FROM pedidos_items 
-    WHERE pedido_id = ?
-    ORDER BY nombre_producto
+    SELECT pi.id, pi.codigo_producto, pi.nombre_producto, pi.cantidad_solicitada, pi.cantidad_recibida,
+        pi.precio_unitario, pi.subtotal, pi.proveedor, pi.estado_item, p.tipo_venta
+    FROM pedidos_items pi
+    JOIN productos p ON pi.codigo_producto = p.codigo
+    WHERE pi.pedido_id = ?
+    ORDER BY pi.nombre_producto
     """
     
     items = pd.read_sql_query(query, conn, params=(pedido_id,))
@@ -412,7 +469,7 @@ def marcar_pedido_como_recibido(pedido_id):
         productos_actualizados = []
         
         for codigo_producto, cantidad_recibida, tipo_venta in items:
-            if tipo_venta == 'granel':
+            if tipo_venta in ['granel', 'kg']:
                 cursor.execute("""
                     UPDATE productos 
                     SET stock_kg = stock_kg + ?
@@ -670,7 +727,7 @@ def actualizar_stock_desde_pedido(pedido_id):
     productos_actualizados = []
     
     for codigo_producto, cantidad_recibida, tipo_venta in items:
-        if tipo_venta == 'granel':
+        if tipo_venta in ['granel', 'kg']:
             cursor.execute("""
                 UPDATE productos 
                 SET stock_kg = stock_kg + ?
@@ -790,8 +847,8 @@ def mostrar():
     with col_header1:
         if es_admin:
             # Obtener tiempo restante usando función centralizada
-            horas_restantes, minutos_restantes = obtener_tiempo_restante()
-            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | Sesión: {horas_restantes}h {minutos_restantes}m restantes")
+            tiempo_restante = obtener_tiempo_restante()
+            st.success(f"✅ **Modo Administrador** - Usuario: {st.session_state.get('usuario_admin', 'admin')} | {tiempo_restante}")
         else:
             st.info("👀 **Modo Solo Lectura** - Consulta de pedidos. Gestión restringida.")
     
@@ -847,13 +904,6 @@ def mostrar():
         if not productos_bajo_stock.empty:
             st.warning(f"⚠️ **{len(productos_bajo_stock)} productos** necesitan reabastecimiento urgente")
             
-            # Nota informativa sobre el criterio de alerta
-            st.info("""
-            🚨 **Criterio de Alerta:** Se muestran productos cuando **Stock Actual ≤ Stock Mínimo**  
-            📊 **Cantidad Sugerida:** Stock Máximo - Stock Actual (para completar capacidad máxima)  
-            💡 **Ejemplo:** Si tienes 5 kg y el máximo es 20 kg → Se sugiere pedir **15 kg**  
-            ✏️ Puedes modificar las cantidades manualmente según tus necesidades
-            """)
             
             # Organizar productos por categoría
             if 'categoria' in productos_bajo_stock.columns:
@@ -903,11 +953,11 @@ def mostrar():
                                 )
                             
                             with col_info:
-                                tipo_icono = "⚖️" if producto['tipo_venta'] == 'granel' else "📦"
+                                tipo_icono = "⚖️" if producto['tipo_venta'] in ['granel', 'kg'] else "📦"
                                 estado_color = "🔴" if producto['porcentaje_stock'] < 25 else "🟡"
                                 
                                 # Mostrar información según tipo de venta
-                                if producto['tipo_venta'] == 'granel':
+                                if producto['tipo_venta'] in ['granel', 'kg']:
                                     stock_actual = producto['stock_kg']
                                     stock_min = producto['stock_minimo_kg']
                                     stock_max = producto.get('stock_maximo_kg', stock_min * 2)
@@ -931,11 +981,11 @@ def mostrar():
                                 if seleccionado:
                                     cantidad_pedido = st.number_input(
                                         "🛒 Cantidad a pedir:",
-                                        min_value=0.1 if producto['tipo_venta'] == 'granel' else 1.0,
+                                        min_value=0.1 if producto['tipo_venta'] in ['granel', 'kg'] else 1.0,
                                         value=float(producto['cantidad_necesaria']),  # Valor por defecto: completar al máximo
-                                        step=0.1 if producto['tipo_venta'] == 'granel' else 1.0,
+                                        step=1.0 if producto['tipo_venta'] in ['granel', 'kg'] else 1.0,
                                         key=f"cantidad_{producto['codigo']}_{categoria}",
-                                        format="%.1f" if producto['tipo_venta'] == 'granel' else "%.0f",
+                                        format="%.1f" if producto['tipo_venta'] in ['granel', 'kg'] else "%.0f",
                                         help="Cantidad sugerida para alcanzar el stock máximo (capacidad completa)"
                                     )
                                 else:
@@ -979,11 +1029,11 @@ def mostrar():
                         )
                     
                     with col_info:
-                        tipo_icono = "⚖️" if producto['tipo_venta'] == 'granel' else "📦"
+                        tipo_icono = "⚖️" if producto['tipo_venta'] in ['granel', 'kg'] else "📦"
                         estado_color = "🔴" if producto['porcentaje_stock'] < 25 else "🟡"
                         
                         # Mostrar información según tipo de venta
-                        if producto['tipo_venta'] == 'granel':
+                        if producto['tipo_venta'] in ['granel', 'kg']:
                             stock_actual = producto['stock_kg']
                             stock_min = producto['stock_minimo_kg']
                             stock_max = producto.get('stock_maximo_kg', stock_min * 2)
@@ -1007,11 +1057,11 @@ def mostrar():
                         if seleccionado:
                             cantidad_pedido = st.number_input(
                                 "🛒 Cantidad a pedir:",
-                                min_value=0.1 if producto['tipo_venta'] == 'granel' else 1.0,
+                                min_value=0.1 if producto['tipo_venta'] in ['granel', 'kg'] else 1.0,
                                 value=float(producto['cantidad_necesaria']),
-                                step=0.1 if producto['tipo_venta'] == 'granel' else 1.0,
+                                step=1.0 if producto['tipo_venta'] in ['granel', 'kg'] else 1.0,
                                 key=f"cantidad_{producto['codigo']}",
-                                format="%.1f" if producto['tipo_venta'] == 'granel' else "%.0f",
+                                format="%.1f" if producto['tipo_venta'] in ['granel', 'kg'] else "%.0f",
                                 help="Cantidad sugerida para alcanzar el stock máximo (capacidad completa)"
                             )
                         else:
@@ -1047,7 +1097,7 @@ def mostrar():
                 for prod in productos_seleccionados:
                     costo_producto = prod['cantidad'] * prod['precio']
                     total_costo += costo_producto
-                    unidad = "Kg" if prod['tipo_venta'] == 'granel' else "unidades"
+                    unidad = "Kg" if prod['tipo_venta'] in ['granel', 'kg'] else "unidades"
                     st.write(f"• **{prod['nombre']}**: {prod['cantidad']:.1f} {unidad} - ${costo_producto:.2f}")
                 
                 st.metric("💰 Costo Total del Pedido", f"${total_costo:.2f}")
@@ -1164,18 +1214,21 @@ def mostrar():
                                 
                                 with col_item_info:
                                     estado_item = "✅" if item['estado_item'] == 'RECIBIDO' else "⏳"
+                                    unidad_item = "kg" if item.get('tipo_venta') in ['granel', 'kg'] else "unid."
                                     st.write(f"{estado_item} **{item['nombre_producto']}** ({item['codigo_producto']})")
-                                    st.write(f"   • Solicitado: {item['cantidad_solicitada']:.1f} | Precio: ${item['precio_unitario']:.2f}")
+                                    st.write(f"   • Solicitado: {item['cantidad_solicitada']:.2f} {unidad_item} | Precio: ${item['precio_unitario']:.2f}")
                                     if item['proveedor']:
                                         st.write(f"   • Proveedor: {item['proveedor']}")
                                 
                                 with col_item_cantidad:
                                     if es_admin and pedido['estado'] != 'COMPLETADO':
+                                        valor_inicial = float(item['cantidad_recibida']) if float(item['cantidad_recibida']) > 0 else float(item['cantidad_solicitada'])
+                                        paso = 1.0 if item.get('tipo_venta') in ['granel', 'kg'] else 1.0
                                         nueva_cant_item = st.number_input(
                                             "Recibido:",
                                             min_value=0.0,
-                                            value=float(item['cantidad_recibida']),
-                                            step=1.0,
+                                            value=valor_inicial,
+                                            step=paso,
                                             key=f"item_{item['id']}_cantidad",
                                             label_visibility="collapsed"
                                         )
@@ -1185,7 +1238,6 @@ def mostrar():
                                         
                                         # Mostrar si hay cambios
                                         if nueva_cant_item != item['cantidad_recibida']:
-                                            st.warning(f"⚠️ Cambio detectado", icon="⚠️")
                                             if st.button("💾 Guardar", key=f"save_item_{item['id']}", use_container_width=True):
                                                 actualizar_item_pedido(item['id'], cantidad_recibida=nueva_cant_item,
                                                                       estado_item='RECIBIDO' if nueva_cant_item > 0 else 'PENDIENTE')
@@ -1193,7 +1245,7 @@ def mostrar():
                                                 time.sleep(0.5)
                                                 st.rerun()
                                     else:
-                                        st.write(f"Recibido: {item['cantidad_recibida']:.1f}")
+                                        st.write(f"Recibido: {item['cantidad_recibida']:.2f} {unidad_item}")
                                 
                                 with col_item_subtotal:
                                     if es_admin and pedido['estado'] != 'COMPLETADO':
@@ -1290,6 +1342,9 @@ def mostrar():
     with tab3:
         st.subheader("📊 Resumen y Estadísticas")
         
+        # Asegurar que los totales reflejen las cantidades recibidas más recientes
+        recalcular_totales_pedidos()
+        
         pedidos_df = obtener_pedidos_activos()
         productos_bajo_stock = obtener_productos_bajo_stock()
         
@@ -1323,7 +1378,7 @@ def mostrar():
         
         with col_inv1:
             if not productos_bajo_stock.empty:
-                # Calcular inversión necesaria para alcanzar stock mínimo
+                # Calcular inversión necesaria usando cantidad_necesaria (que ya es la cantidad hasta stock mínimo o sugerida)
                 inversion_minimo = (productos_bajo_stock['cantidad_necesaria'] * productos_bajo_stock['precio_compra']).sum()
                 st.metric(
                     "📊 Hasta Stock Mínimo", 
@@ -1334,9 +1389,14 @@ def mostrar():
                 st.metric("📊 Hasta Stock Mínimo", "$0.00")
         
         with col_inv2:
-            if not productos_bajo_stock.empty and 'cantidad_hasta_maximo' in productos_bajo_stock.columns:
-                # Calcular inversión necesaria para alcanzar stock máximo
-                inversion_maximo = (productos_bajo_stock['cantidad_hasta_maximo'] * productos_bajo_stock['precio_compra']).sum()
+            if not productos_bajo_stock.empty:
+                # Calcular inversión necesaria usando cantidad_hasta_maximo (que llega al stock máximo)
+                if 'cantidad_hasta_maximo' in productos_bajo_stock.columns:
+                    inversion_maximo = (productos_bajo_stock['cantidad_hasta_maximo'] * productos_bajo_stock['precio_compra']).sum()
+                else:
+                    # Fallback: usar cantidad_necesaria si no existe cantidad_hasta_maximo
+                    inversion_maximo = (productos_bajo_stock['cantidad_necesaria'] * productos_bajo_stock['precio_compra']).sum()
+                
                 st.metric(
                     "🎯 Hasta Stock Máximo", 
                     f"${inversion_maximo:.2f}",
@@ -1346,18 +1406,19 @@ def mostrar():
                 st.metric("🎯 Hasta Stock Máximo", "$0.00")
         
         with col_inv3:
-            if not productos_bajo_stock.empty and 'cantidad_hasta_maximo' in productos_bajo_stock.columns:
-                # Calcular diferencia de inversión
-                inversion_minimo = (productos_bajo_stock['cantidad_necesaria'] * productos_bajo_stock['precio_compra']).sum()
-                inversion_maximo = (productos_bajo_stock['cantidad_hasta_maximo'] * productos_bajo_stock['precio_compra']).sum()
-                diferencia = inversion_maximo - inversion_minimo
+            # Mostrar el total del pedido activo (pendiente o recibido) en lugar de la diferencia
+            if not pedidos_df.empty:
+                # Obtener el total de pedidos que NO están completados (PENDIENTE o RECIBIDO)
+                pedidos_activos = pedidos_df[pedidos_df['estado'].isin(['PENDIENTE', 'RECIBIDO'])]
+                total_pedido_activo = pedidos_activos['total_costo'].sum()
+                
                 st.metric(
-                    "💎 Inversión Adicional", 
-                    f"${diferencia:.2f}",
-                    help="Diferencia entre alcanzar stock mínimo vs stock máximo"
+                    "💰 Total del Pedido Activo", 
+                    f"${total_pedido_activo:.2f}",
+                    help="Total del pedido actual en proceso (PENDIENTE o RECIBIDO)"
                 )
             else:
-                st.metric("💎 Inversión Adicional", "$0.00")
+                st.metric("💰 Total del Pedido Activo", "$0.00")
         
         # Exportar datos
         st.divider()
